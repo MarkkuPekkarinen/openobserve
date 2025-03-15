@@ -47,6 +47,32 @@ use crate::{
 };
 
 // 1. submit
+// refer mod.rs to generate the swagger docs
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Search",
+    operation_id = "SearchSQL",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    request_body(content = SearchRequest, description = "Search query", content_type = "application/json", example = json!({
+        "query": {
+            "sql": "select * from k8s ",
+            "start_time": 1675182660872049i64,
+            "end_time": 1675185660872049i64,
+            "limit": 100,
+            "offset": 0,
+        }
+    })),
+    responses(
+        (status = 200, description = "Search Job submitted successfully", body = MetaHttpResponse),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse),
+        (status = 500, description = "Internal Server Error", body = MetaHttpResponse),
+    )
+)]
 #[post("/{org_id}/search_jobs")]
 pub async fn submit_job(
     org_id: web::Path<String>,
@@ -148,6 +174,36 @@ pub async fn submit_job(
 }
 
 // 2. status_all
+#[utoipa::path(
+    context_path = "/api", 
+    tag = "Search Jobs",
+    operation_id = "ListSearchJobs",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name")
+    ),
+    responses(
+        (status = 200, description = "List of search jobs", body = Vec<JobModel>, example = json!([{
+            "id": "abc123",
+            "trace_id": "xyz789",
+            "org_id": "default",
+            "user_id": "user1",
+            "stream_type": "logs",
+            "stream_names": "[\"stream1\"]",
+            "payload": "...",
+            "start_time": 1675182660872049i64,
+            "end_time": 1675185660872049i64,
+            "created_at": 1675182660872049i64,
+            "updated_at": 1675182660872049i64,
+            "status": 1,
+            "cluster": "cluster1",
+            "result_path": "/path/to/result"
+        }])),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse)
+    )
+)]
 #[get("/{org_id}/search_jobs")]
 pub async fn list_status(org_id: web::Path<String>) -> Result<HttpResponse, Error> {
     let res = list_status_by_org_id(&org_id).await;
@@ -160,6 +216,37 @@ pub async fn list_status(org_id: web::Path<String>) -> Result<HttpResponse, Erro
 }
 
 // 3. status
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Search Jobs", 
+    operation_id = "GetSearchJobStatus",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("job_id" = String, Path, description = "Search job ID")
+    ),
+    responses(
+        (status = 200, description = "Search job status", body = JobModel, example = json!({
+            "id": "abc123",
+            "trace_id": "xyz789", 
+            "org_id": "default",
+            "user_id": "user1",
+            "stream_type": "logs",
+            "stream_names": "[\"stream1\"]",
+            "payload": "...",
+            "start_time": 1675182660872049i64,
+            "end_time": 1675185660872049i64,
+            "created_at": 1675182660872049i64,
+            "updated_at": 1675182660872049i64,
+            "status": 1,
+            "cluster": "cluster1",
+            "result_path": "/path/to/result"
+        })),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse)
+    )
+)]
 #[get("/{org_id}/search_jobs/{job_id}/status")]
 pub async fn get_status(
     path: web::Path<(String, String)>,
@@ -188,6 +275,25 @@ pub async fn get_status(
 }
 
 // 4. cancel
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Search Jobs",
+    operation_id = "CancelSearchJob", 
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("job_id" = String, Path, description = "Search job ID")
+    ),
+    responses(
+        (status = 200, description = "Search job cancelled successfully", body = MetaHttpResponse, example = json!({
+            "code": 200,
+            "message": "[Job_Id: abc123] Running Search Job cancelled successfully."
+        })),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse)
+    )
+)]
 #[post("/{org_id}/search_jobs/{job_id}/cancel")]
 pub async fn cancel_job(
     path: web::Path<(String, String)>,
@@ -212,6 +318,31 @@ pub async fn cancel_job(
 }
 
 // 5. get
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Search Jobs",
+    operation_id = "GetSearchJobResult",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("job_id" = String, Path, description = "Search job ID"),
+        ("from" = Option<i64>, Query, description = "Pagination start offset"),
+        ("size" = Option<i64>, Query, description = "Number of results to return")
+    ),
+    responses(
+        (status = 200, description = "Search job results", body = Response, example = json!({
+            "took": 155,
+            "hits": [],
+            "total": 27179431,
+            "from": 0,
+            "size": 100
+        })),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse),
+        (status = 404, description = "Not Found", body = MetaHttpResponse)
+    )
+)]
 #[get("/{org_id}/search_jobs/{job_id}/result")]
 pub async fn get_job_result(
     path: web::Path<(String, String)>,
@@ -265,6 +396,26 @@ pub async fn get_job_result(
 }
 
 // 6. delete
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Search Jobs",
+    operation_id = "DeleteSearchJob",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("job_id" = String, Path, description = "Search job ID")
+    ),
+    responses(
+        (status = 200, description = "Search job deleted successfully", body = MetaHttpResponse, example = json!({
+            "code": 200,
+            "message": "[Job_Id: abc123] Running Search Job deleted successfully."
+        })),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse),
+        (status = 404, description = "Not Found", body = MetaHttpResponse)
+    )
+)]
 #[delete("/{org_id}/search_jobs/{job_id}")]
 pub async fn delete_job(
     path: web::Path<(String, String)>,
@@ -302,6 +453,26 @@ pub async fn delete_job(
 }
 
 // 7. retry
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Search Jobs",
+    operation_id = "RetrySearchJob",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("job_id" = String, Path, description = "Search job ID")
+    ),
+    responses(
+        (status = 200, description = "Search job retry initiated successfully", body = MetaHttpResponse, example = json!({
+            "code": 200,
+            "message": "[Job_Id: abc123] Search Job retry successfully."
+        })),
+        (status = 400, description = "Bad Request", body = MetaHttpResponse),
+        (status = 403, description = "Forbidden - Job cannot be retried", body = MetaHttpResponse)
+    )
+)]
 #[post("/{org_id}/search_jobs/{job_id}/retry")]
 pub async fn retry_job(
     path: web::Path<(String, String)>,
