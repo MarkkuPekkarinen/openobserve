@@ -47,7 +47,6 @@ use crate::{
 };
 
 // 1. submit
-// refer mod.rs to generate the swagger docs
 #[utoipa::path(
     context_path = "/api",
     tag = "Search",
