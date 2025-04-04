@@ -402,7 +402,7 @@ pub async fn search_memtable(
         // merge small batches into big batches
         let mut merge_groupes = Vec::new();
         let mut current_group = Vec::new();
-        let group_limit = config::PARQUET_BATCH_SIZE;
+        let group_limit = 100;
         let mut group_size = 0;
         for batch in record_batches {
             if group_size > 0 && group_size + batch.num_rows() > group_limit {
@@ -420,21 +420,6 @@ pub async fn search_memtable(
             .into_iter()
             .map(|group| concat_batches(group[0].schema().clone(), group).unwrap())
             .collect::<Vec<_>>();
-
-        // split record_batches into chunks by cpu_num
-        // let chunk_size = record_batches.len().div_ceil(cfg.limit.cpu_num);
-        // let mut new_batches = Vec::with_capacity(cfg.limit.cpu_num);
-        // let mut current_group = Vec::new();
-        // for batch in record_batches {
-        //     if current_group.len() >= chunk_size {
-        //         new_batches.push(current_group);
-        //         current_group = Vec::new();
-        //     }
-        //     current_group.push(batch);
-        // }
-        // if !current_group.is_empty() {
-        //     new_batches.push(current_group);
-        // }
 
         let table = match NewMemTable::try_new(
             record_batches[0].schema().clone(),
