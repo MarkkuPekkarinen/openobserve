@@ -25,7 +25,7 @@ use config::{
     utils::{
         file::{is_exists, scan_files},
         parquet::{parse_time_range_from_filename, read_metadata_from_file},
-        record_batch_ext::concat_batches,
+        schema_ext::SchemaExt,
     },
 };
 use datafusion::{
@@ -399,46 +399,14 @@ pub async fn search_memtable(
             *batch = adapt_batch(schema_latest.clone(), batch);
         }
 
-        // merge small batches into big batches
-        let mut merge_groupes = Vec::new();
-        let mut current_group = Vec::new();
-        let group_limit = config::PARQUET_BATCH_SIZE;
-        let mut group_size = 0;
-        for batch in record_batches {
-            if group_size > 0 && group_size + batch.num_rows() > group_limit {
-                merge_groupes.push(current_group);
-                current_group = Vec::new();
-                group_size = 0;
-            }
-            group_size += batch.num_rows();
-            current_group.push(batch);
-        }
-        if !current_group.is_empty() {
-            merge_groupes.push(current_group);
-        }
-        let record_batches = merge_groupes
-            .into_iter()
-            .map(|group| concat_batches(group[0].schema().clone(), group).unwrap())
+        let cloned_schema = record_batches
+            .iter()
+            .map(|b| b.schema().clone())
             .collect::<Vec<_>>();
 
-        // split record_batches into chunks by cpu_num
-        let chunk_size = record_batches.len().div_ceil(cfg.limit.cpu_num);
-        let mut new_batches = Vec::with_capacity(cfg.limit.cpu_num);
-        let mut current_group = Vec::new();
-        for batch in record_batches {
-            if current_group.len() >= chunk_size {
-                new_batches.push(current_group);
-                current_group = Vec::new();
-            }
-            current_group.push(batch);
-        }
-        if !current_group.is_empty() {
-            new_batches.push(current_group);
-        }
-
         let table = match NewMemTable::try_new(
-            new_batches[0][0].schema().clone(),
-            new_batches,
+            record_batches[0].schema().clone(),
+            vec![record_batches],
             diff_fields,
             sorted_by_time,
             index_condition.clone(),
@@ -451,6 +419,15 @@ pub async fn search_memtable(
                     query.trace_id,
                     e
                 );
+                for (i, schema) in cloned_schema.iter().enumerate() {
+                    log::error!(
+                        "[trace_id {}] wal->mem->search: batch_id: {}, schema_key: {}, schema: {:?}",
+                        query.trace_id,
+                        i,
+                        schema.hash_key(),
+                        schema
+                    );
+                }
                 return Err(e.into());
             }
         };
