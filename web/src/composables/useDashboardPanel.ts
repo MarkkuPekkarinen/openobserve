@@ -1355,7 +1355,7 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
   };
 
   const removeXAxisItemByIndex = (index: number) => {
-      if (index >= 0) {
+    if (index >= 0) {
       dashboardPanelData.data.queries[
         dashboardPanelData.layout.currentQueryIndex
       ].fields.x.splice(index, 1);
@@ -2478,7 +2478,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
           field,
           dashboardPanelData.data.queries[
             dashboardPanelData.layout.currentQueryIndex
-          ].fields?.stream,
+          ]?.joins?.length
+            ? dashboardPanelData.data.queries[
+                dashboardPanelData.layout.currentQueryIndex
+              ].fields?.stream
+            : "",
         );
 
         // Skip fields that return empty expressions
@@ -2506,7 +2510,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
       ].joins,
       dashboardPanelData.data.queries[
         dashboardPanelData.layout.currentQueryIndex
-      ].fields?.stream,
+      ]?.joins?.length
+        ? dashboardPanelData.data.queries[
+            dashboardPanelData.layout.currentQueryIndex
+          ].fields?.stream
+        : "",
     )}`;
 
     // 3. Filter
@@ -2664,7 +2672,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         name,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
 
       query += sqlField ? `${sqlField} as "${name.alias}",  ` : "";
@@ -2673,7 +2685,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         value_for_maps,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       query += sqlValue ? `${sqlValue} as "${value_for_maps.alias}"` : "";
 
@@ -2761,13 +2777,21 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         latitude,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       const sqlLongitude = buildSQLQueryFromInput(
         longitude,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       query =
         sqlLatitude && sqlLongitude
@@ -2783,7 +2807,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         latitude,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       query = sqlLatitude
         ? `SELECT ${sqlLatitude} as "${latitude.alias}"`
@@ -2794,7 +2822,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         longitude,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       query = sqlLongitude
         ? `SELECT ${sqlLongitude} as "${longitude.alias}"`
@@ -2808,7 +2840,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
           weight,
           dashboardPanelData.data.queries[
             dashboardPanelData.layout.currentQueryIndex
-          ].fields?.stream,
+          ]?.joins?.length
+            ? dashboardPanelData.data.queries[
+                dashboardPanelData.layout.currentQueryIndex
+              ].fields?.stream
+            : "",
         );
         query += sqlWeight ? `, ${sqlWeight} as "${weight.alias}"` : `, `;
       }
@@ -2913,7 +2949,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         source,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
 
       if (sqlSource) {
@@ -2927,7 +2967,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         target,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       if (sqlTarget) {
         selectFields.push(`${sqlTarget} as ${target.alias}`);
@@ -2966,7 +3010,11 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
         value,
         dashboardPanelData.data.queries[
           dashboardPanelData.layout.currentQueryIndex
-        ].fields?.stream,
+        ]?.joins?.length
+          ? dashboardPanelData.data.queries[
+              dashboardPanelData.layout.currentQueryIndex
+            ].fields?.stream
+          : "",
       );
       if (sqlValue) {
         selectFields.push(`${sqlValue} as "${value.alias}"`);
