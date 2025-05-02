@@ -37,7 +37,7 @@ pub async fn get_cached_results(
     cache_req: CacheQueryRequest,
 ) -> Vec<CachedQueryResponse> {
     // get nodes from cluster
-    let mut nodes = match infra_cluster::get_cached_online_query_nodes(None).await {
+    let mut nodes = match infra_cluster::get_cached_online_querier_nodes(None).await {
         Some(nodes) => nodes,
         None => {
             log::error!("[trace_id {trace_id}] get_cached_results: no querier node online");
@@ -126,11 +126,8 @@ pub async fn get_cached_results(
                             &node.grpc_addr,
                             err
                         );
-                        if err.code() == tonic::Code::Internal {
-                            let err = ErrorCodes::from_json(err.message())?;
-                            return Err(Error::ErrorCode(err));
-                        }
-                        return Err(super::super::server_internal_error("querier node error"));
+                        let err = ErrorCodes::from_json(err.message())?;
+                        return Err(Error::ErrorCode(err));
                     }
                 };
 

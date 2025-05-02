@@ -39,7 +39,7 @@ use openobserve::{
     cli::basic::cli,
     common::{
         infra::{self as common_infra, cluster},
-        meta, migration,
+        meta,
         utils::zo_logger,
     },
     handler::{
@@ -59,10 +59,10 @@ use openobserve::{
         },
         http::router::*,
     },
-    job, router,
+    job, migration, router,
     service::{
-        db, metadata, node::NodeService, search::SEARCH_SERVER, self_reporting,
-        tls::http_tls_config,
+        cluster_info::ClusterInfoService, db, metadata, node::NodeService, search::SEARCH_SERVER,
+        self_reporting, tls::http_tls_config,
     },
 };
 use opentelemetry::{KeyValue, global, trace::TracerProvider};
@@ -74,7 +74,8 @@ use opentelemetry_proto::tonic::collector::{
 };
 use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator};
 use proto::cluster_rpc::{
-    event_server::EventServer, ingest_server::IngestServer, metrics_server::MetricsServer,
+    cluster_info_service_server::ClusterInfoServiceServer, event_server::EventServer,
+    ingest_server::IngestServer, metrics_server::MetricsServer,
     node_service_server::NodeServiceServer, query_cache_server::QueryCacheServer,
     search_server::SearchServer, streams_server::StreamsServer,
 };
@@ -91,6 +92,8 @@ use tonic::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Registry;
+#[cfg(feature = "enterprise")]
+use {config::Config, o2_enterprise::enterprise::common::infra::config::O2Config};
 #[cfg(feature = "pyroscope")]
 use {
     pyroscope::PyroscopeAgent,
@@ -110,6 +113,7 @@ use tracing_subscriber::{
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let cfg = get_config();
+
     #[cfg(feature = "tokio-console")]
     console_subscriber::ConsoleLayer::builder()
         .retention(Duration::from_secs(
@@ -243,6 +247,13 @@ async fn main() -> Result<(), anyhow::Error> {
                 job_init_tx.send(false).ok();
                 panic!("config init failed: {}", e);
             }
+
+            // db related inits
+            if let Err(e) = migration::init_db().await {
+                job_init_tx.send(false).ok();
+                panic!("db init failed: {}", e);
+            }
+
             // init infra
             if let Err(e) = infra::init().await {
                 job_init_tx.send(false).ok();
@@ -258,30 +269,6 @@ async fn main() -> Result<(), anyhow::Error> {
             if let Err(e) = crate::init_enterprise().await {
                 job_init_tx.send(false).ok();
                 panic!("enerprise init failed: {}", e);
-            }
-
-            // check version upgrade
-            let old_version = db::version::get().await.unwrap_or("v0.0.0".to_string());
-            if let Err(e) = migration::check_upgrade(&old_version, config::VERSION).await {
-                job_init_tx.send(false).ok();
-                panic!("check upgrade failed: {}", e);
-            }
-
-            #[allow(deprecated)]
-            migration::upgrade_resource_names()
-                .await
-                .expect("migrate resource names into supported ofga format failed");
-
-            // migrate infra_sea_orm
-            if let Err(e) = infra::table::migrate().await {
-                job_init_tx.send(false).ok();
-                panic!("infra sea_orm migrate failed: {}", e);
-            }
-
-            // migrate dashboards
-            if let Err(e) = migration::dashboards::run().await {
-                job_init_tx.send(false).ok();
-                panic!("migrate dashboards failed: {}", e);
             }
 
             // ingester init
@@ -305,7 +292,7 @@ async fn main() -> Result<(), anyhow::Error> {
             // init websocket gc
             if cfg.websocket.enabled {
                 log::info!("Initializing WebSocket session garbage collector");
-                if let Err(e) = handler::http::request::websocket::init().await {
+                if let Err(e) = handler::http::request::ws::init().await {
                     job_init_tx.send(false).ok();
                     panic!("websocket gc init failed: {}", e);
                 }
@@ -552,6 +539,11 @@ async fn init_common_grpc_server(
         .accept_compressed(CompressionEncoding::Gzip)
         .max_decoding_message_size(cfg.grpc.max_message_size * 1024 * 1024)
         .max_encoding_message_size(cfg.grpc.max_message_size * 1024 * 1024);
+    let cluster_info_svc = ClusterInfoServiceServer::new(ClusterInfoService)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(cfg.grpc.max_message_size * 1024 * 1024)
+        .max_encoding_message_size(cfg.grpc.max_message_size * 1024 * 1024);
 
     log::info!(
         "starting gRPC server {} at {}",
@@ -580,6 +572,7 @@ async fn init_common_grpc_server(
         .add_service(streams_svc)
         .add_service(flight_svc)
         .add_service(node_svc)
+        .add_service(cluster_info_svc)
         .serve_with_shutdown(gaddr, async {
             shutdown_rx.await.ok();
             log::info!("gRPC server starts shutting down");
@@ -678,10 +671,18 @@ async fn init_http_server() -> Result<(), anyhow::Error> {
         if config::cluster::LOCAL_NODE.is_router() {
             let http_client =
                 router::http::create_http_client().expect("Failed to create http tls client");
+            let factory = web::scope(&cfg.common.base_uri);
+            #[cfg(feature = "enterprise")]
+            let factory = factory.wrap(
+                o2_ratelimit::middleware::RateLimitController::new_with_extractor(Some(
+                    router::ratelimit::resource_extractor::default_extractor,
+                )),
+            );
+
             app = app
                 .service(
                     // if `cfg.common.base_uri` is empty, scope("") still works as expected.
-                    web::scope(&cfg.common.base_uri)
+                    factory
                         .wrap(middlewares::SlowLog::new(
                             cfg.limit.http_slow_log_threshold,
                             cfg.limit.circuit_breaker_enabled,
@@ -790,10 +791,18 @@ async fn init_http_server_without_tracing() -> Result<(), anyhow::Error> {
         if config::cluster::LOCAL_NODE.is_router() {
             let http_client =
                 router::http::create_http_client().expect("Failed to create http tls client");
+            let factory = web::scope(&cfg.common.base_uri);
+            #[cfg(feature = "enterprise")]
+            let factory = factory.wrap(
+                o2_ratelimit::middleware::RateLimitController::new_with_extractor(Some(
+                    router::ratelimit::resource_extractor::default_extractor,
+                )),
+            );
+
             app = app
                 .service(
                     // if `cfg.common.base_uri` is empty, scope("") still works as expected.
-                    web::scope(&cfg.common.base_uri)
+                    factory
                         .wrap(middlewares::SlowLog::new(
                             cfg.limit.http_slow_log_threshold,
                             cfg.limit.circuit_breaker_enabled,
@@ -1168,6 +1177,36 @@ async fn init_enterprise() -> Result<(), anyhow::Error> {
         openobserve::super_cluster_queue::init().await?;
     }
 
+    // check ratelimit config
+    let cfg = config::get_config();
+    let o2cfg = o2_enterprise::enterprise::common::infra::config::get_config();
+    if let Err(e) = check_ratelimit_config(&cfg, &o2cfg) {
+        panic!("ratelimit config error: {e}");
+    }
+
     o2_enterprise::enterprise::pipeline::pipeline_file_server::PipelineFileServer::run().await?;
+    if o2cfg.rate_limit.rate_limit_enabled && o2_openfga::config::get_config().enabled {
+        o2_ratelimit::init(openobserve::handler::http::router::openapi::openapi_info().await)
+            .await?;
+    }
+    Ok(())
+}
+#[cfg(feature = "enterprise")]
+fn check_ratelimit_config(cfg: &Config, o2cfg: &O2Config) -> Result<(), anyhow::Error> {
+    if o2cfg.rate_limit.rate_limit_enabled {
+        let meta_store: config::meta::meta_store::MetaStore =
+            cfg.common.queue_store.as_str().into();
+        if meta_store != config::meta::meta_store::MetaStore::Nats {
+            return Err(anyhow::anyhow!(
+                "ZO_QUEUE_STORE must be nats when ratelimit is enabled"
+            ));
+        }
+    }
+
+    if o2cfg.rate_limit.rate_limit_rule_refresh_interval < 2 {
+        return Err(anyhow::anyhow!(
+            "ratelimit rules refresh interval must be greater than or equal to 2 seconds"
+        ));
+    }
     Ok(())
 }

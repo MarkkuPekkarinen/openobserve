@@ -22,7 +22,7 @@ use actix_web::http;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use config::{
-    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
+    ALL_VALUES_COL_NAME, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
     meta::{
         self_reporting::usage::UsageType,
         stream::{StreamParams, StreamType},
@@ -47,8 +47,10 @@ use crate::{
         StreamStatus,
     },
     service::{
-        format_stream_name, get_formatted_stream_name, ingestion::check_ingestion_allowed,
-        logs::bulk::TRANSFORM_FAILED, schema::get_upto_discard_error,
+        format_stream_name, get_formatted_stream_name,
+        ingestion::check_ingestion_allowed,
+        logs::bulk::TRANSFORM_FAILED,
+        schema::{get_future_discard_error, get_upto_discard_error},
     },
 };
 
@@ -77,6 +79,8 @@ pub async fn ingest(
 
     let min_ts = (Utc::now() - Duration::try_hours(cfg.limit.ingest_allowed_upto).unwrap())
         .timestamp_micros();
+    let max_ts = (Utc::now() + Duration::try_hours(cfg.limit.ingest_allowed_in_future).unwrap())
+        .timestamp_micros();
 
     let mut stream_params = vec![StreamParams::new(org_id, &stream_name, StreamType::Logs)];
 
@@ -99,10 +103,12 @@ pub async fn ingest(
     // Start get user defined schema
     let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
     let mut streams_need_original_map: HashMap<String, bool> = HashMap::new();
+    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::new();
     crate::service::ingestion::get_uds_and_original_data_streams(
         &stream_params,
         &mut user_defined_schema_map,
         &mut streams_need_original_map,
+        &mut streams_need_all_values_map,
     )
     .await;
     // with pipeline, we need to store original if any of the destinations requires original
@@ -204,7 +210,7 @@ pub async fn ingest(
             let mut res = flatten::flatten_with_level(item, cfg.limit.ingest_flatten_level)?;
 
             // handle timestamp
-            let timestamp = match handle_timestamp(&mut res, min_ts) {
+            let timestamp = match handle_timestamp(&mut res, min_ts, max_ts) {
                 Ok(ts) => ts,
                 Err(e) => {
                     stream_status.status.failed += 1;
@@ -253,12 +259,38 @@ pub async fn ingest(
                 );
             }
 
+            // add `_all_values` if required by StreamSettings
+            if streams_need_all_values_map
+                .get(&stream_name)
+                .is_some_and(|v| *v)
+            {
+                let mut values = Vec::with_capacity(local_val.len());
+                for (k, value) in local_val.iter() {
+                    if [
+                        TIMESTAMP_COL_NAME,
+                        ID_COL_NAME,
+                        ORIGINAL_DATA_COL_NAME,
+                        ALL_VALUES_COL_NAME,
+                    ]
+                    .contains(&k.as_str())
+                    {
+                        continue;
+                    }
+                    values.push(value.to_string());
+                }
+                local_val.insert(
+                    ALL_VALUES_COL_NAME.to_string(),
+                    json::Value::String(values.join(" ")),
+                );
+            }
+
             let (ts_data, fn_num) = json_data_by_stream
                 .entry(stream_name.clone())
                 .or_insert_with(|| (Vec::new(), None));
             ts_data.push((timestamp, local_val));
             *fn_num = need_usage_report.then_some(0); // no pl -> no func
         }
+        tokio::task::coop::consume_budget().await;
     }
 
     // batch process records through pipeline
@@ -300,13 +332,14 @@ pub async fn ingest(
                             &[stream_params],
                             &mut user_defined_schema_map,
                             &mut streams_need_original_map,
+                            &mut streams_need_all_values_map,
                         )
                         .await;
                     }
 
                     for (idx, mut res) in stream_pl_results {
                         // handle timestamp
-                        let timestamp = match handle_timestamp(&mut res, min_ts) {
+                        let timestamp = match handle_timestamp(&mut res, min_ts, max_ts) {
                             Ok(ts) => ts,
                             Err(e) => {
                                 stream_status.status.failed += 1;
@@ -356,11 +389,38 @@ pub async fn ingest(
                             );
                         }
 
+                        // add `_all_values` if required by StreamSettings
+                        if streams_need_all_values_map
+                            .get(&destination_stream)
+                            .is_some_and(|v| *v)
+                        {
+                            let mut values = Vec::with_capacity(local_val.len());
+                            for (k, value) in local_val.iter() {
+                                if [
+                                    TIMESTAMP_COL_NAME,
+                                    ID_COL_NAME,
+                                    ORIGINAL_DATA_COL_NAME,
+                                    ALL_VALUES_COL_NAME,
+                                ]
+                                .contains(&k.as_str())
+                                {
+                                    continue;
+                                }
+                                values.push(value.to_string());
+                            }
+                            local_val.insert(
+                                ALL_VALUES_COL_NAME.to_string(),
+                                json::Value::String(values.join(" ")),
+                            );
+                        }
+
                         let (ts_data, fn_num) = json_data_by_stream
                             .entry(destination_stream.clone())
                             .or_insert_with(|| (Vec::new(), None));
                         ts_data.push((timestamp, local_val));
                         *fn_num = need_usage_report.then_some(function_no);
+
+                        tokio::task::coop::consume_budget().await;
                     }
                 }
             }
@@ -377,6 +437,7 @@ pub async fn ingest(
 
     // drop memory-intensive variables
     drop(streams_need_original_map);
+    drop(streams_need_all_values_map);
     drop(executable_pipeline);
     drop(original_options);
     drop(user_defined_schema_map);
@@ -435,7 +496,11 @@ pub async fn ingest(
     ))
 }
 
-pub fn handle_timestamp(value: &mut json::Value, min_ts: i64) -> Result<i64, anyhow::Error> {
+pub fn handle_timestamp(
+    value: &mut json::Value,
+    min_ts: i64,
+    max_ts: i64,
+) -> Result<i64, anyhow::Error> {
     let local_val = value
         .as_object_mut()
         .ok_or_else(|| anyhow::Error::msg("Value is not an object"))?;
@@ -449,6 +514,9 @@ pub fn handle_timestamp(value: &mut json::Value, min_ts: i64) -> Result<i64, any
     // check ingestion time
     if timestamp < min_ts {
         return Err(get_upto_discard_error());
+    }
+    if timestamp > max_ts {
+        return Err(get_future_discard_error());
     }
     local_val.insert(
         TIMESTAMP_COL_NAME.to_string(),

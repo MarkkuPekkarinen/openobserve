@@ -60,7 +60,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               <div
                 data-test="add-alert-name-input"
                 class="alert-name-input o2-input"
-                style="padding-top: 12px;"
+                style="padding-top: 12px"
               >
                 <q-input
                   v-model="formData.name"
@@ -91,9 +91,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     @folder-selected="updateActiveFolderId"
                     :activeFolderId="activeFolderId"
                     :style="'height: 30px'"
-                />
+                  />
                 </div>
-               
               </div>
 
               <div
@@ -439,6 +438,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               <q-btn
                 data-test="add-alert-submit-btn"
                 :label="t('alerts.save')"
+                :loading="isAlertSaving"
+                :disable="isAlertSaving"
                 class="q-mb-md text-bold no-border q-ml-md"
                 color="secondary"
                 padding="sm xl"
@@ -504,7 +505,6 @@ import { outlinedInfo } from "@quasar/extras/material-icons-outlined";
 import useFunctions from "@/composables/useFunctions";
 import useQuery from "@/composables/useQuery";
 import searchService from "@/services/search";
-import { convertDateToTimestamp } from "@/utils/date";
 
 import SelectFolderDropDown from "../common/sidebar/SelectFolderDropDown.vue";
 import cronParser from "cron-parser";
@@ -560,7 +560,7 @@ const defaultValue: any = () => {
     updatedAt: "",
     owner: "",
     lastEditedBy: "",
-    folder_id : "",
+    folder_id: "",
   };
 };
 let callAlert: Promise<{ data: any }>;
@@ -653,8 +653,12 @@ export default defineComponent({
     const vrlFunctionError = ref("");
 
     const showTimezoneWarning = ref(false);
-    
-    const activeFolderId = ref(router.currentRoute.value.query.folder || "default");
+
+    const activeFolderId = ref(
+      router.currentRoute.value.query.folder || "default",
+    );
+
+    const isAlertSaving = ref(false);
 
     const updateActiveFolderId = (folderId: any) => {
       activeFolderId.value = folderId.value;
@@ -1213,6 +1217,10 @@ export default defineComponent({
       query.query.start_time = query.query.start_time + 780000000;
 
       query.query.sql = formData.value.query_condition.sql;
+      //removed the encoding as it is not required for the alert queries
+      if (store.state.zoConfig.sql_base64_enabled && query?.encoding) {
+        delete query.encoding;
+      }
 
       if (formData.value.query_condition.vrl_function)
         query.query.query_fn = b64EncodeUnicode(
@@ -1231,9 +1239,10 @@ export default defineComponent({
 
             if (res.data?.function_error) {
               vrlFunctionError.value = res.data.function_error;
+              let msg = vrlFunctionError.value || "Invalid VRL Function";
               q.notify({
                 type: "negative",
-                message: "Invalid VRL Function",
+                message: msg,
                 timeout: 3000,
               });
               reject("function_error");
@@ -1356,7 +1365,6 @@ export default defineComponent({
       sqlQueryErrorMsg,
       vrlFunctionError,
       updateFunctionVisibility,
-      convertDateToTimestamp,
       getTimezonesByOffset,
       showTimezoneWarning,
       updateMultiTimeRange,
@@ -1365,6 +1373,7 @@ export default defineComponent({
       activeFolderId,
       updateActiveFolderId,
       alertType,
+      isAlertSaving,
     };
   },
 
@@ -1372,10 +1381,10 @@ export default defineComponent({
     // TODO OK: Refactor this code
     this.formData.ingest = ref(false);
     this.formData = { ...defaultValue, ...cloneDeep(this.modelValue) };
-    if(!this.isUpdated){
-      this.formData.is_real_time = this.alertType === 'realTime'? true : false;
+    if (!this.isUpdated) {
+      this.formData.is_real_time = this.alertType === "realTime" ? true : false;
     }
-      this.formData.is_real_time = this.formData.is_real_time.toString();
+    this.formData.is_real_time = this.formData.is_real_time.toString();
 
     // Set default frequency to min_auto_refresh_interval
     if (this.store.state?.zoConfig?.min_auto_refresh_interval)
@@ -1455,6 +1464,9 @@ export default defineComponent({
     async onSubmit() {
       // Delaying submission by 500ms to allow the form to validate, as query is validated in validateSqlQuery method
       // When user updated query and click on save
+      // made the isAlertSaving to true to disable the save button
+      // and also added a spinner to the save button
+      this.isAlertSaving = true;
       await new Promise((resolve) => setTimeout(resolve, 500));
 
       if (
@@ -1467,6 +1479,7 @@ export default defineComponent({
           message: "Selecting all Columns in SQL query is not allowed.",
           timeout: 1500,
         });
+        this.isAlertSaving = false;
         return false;
       }
 
@@ -1476,6 +1489,7 @@ export default defineComponent({
           message: "Please select stream name.",
           timeout: 1500,
         });
+        this.isAlertSaving = false;
         return false;
       }
 
@@ -1483,39 +1497,22 @@ export default defineComponent({
         this.formData.is_real_time == "false" &&
         this.formData.trigger_condition.frequency_type == "cron"
       ) {
-        const now = new Date();
-
-        // Get the day, month, and year from the date object
-        const day = String(now.getDate()).padStart(2, "0");
-        const month = String(now.getMonth() + 1).padStart(2, "0"); // January is 0!
-        const year = now.getFullYear();
-
-        // Combine them in the DD-MM-YYYY format
-        const date = `${day}-${month}-${year}`;
-
-        // Get the hours and minutes, ensuring they are formatted with two digits
-        const hours = String(now.getHours()).padStart(2, "0");
-        const minutes = String(now.getMinutes()).padStart(2, "0");
-
-        // Combine them in the HH:MM format
-        const time = `${hours}:${minutes}`;
-
-        const convertedDateTime = this.convertDateToTimestamp(
-          date,
-          time,
+        this.formData.tz_offset = getTimezoneOffset(
           this.formData.trigger_condition.timezone,
         );
-
-        this.formData.tz_offset = convertedDateTime.offset;
       }
 
       this.addAlertForm.validate().then(async (valid: any) => {
         if (!valid) {
+          this.isAlertSaving = false;
           return false;
         }
 
         const payload = this.getAlertPayload();
-        if (!this.validateInputs(payload)) return;
+        if (!this.validateInputs(payload)) {
+          this.isAlertSaving = false;
+          return;
+        }
 
         const dismiss = this.q.notify({
           spinner: true,
@@ -1536,29 +1533,33 @@ export default defineComponent({
           } catch (error) {
             dismiss();
             console.log("Error while validating sql query");
+            this.isAlertSaving = false;
             return false;
           }
         }
 
         if (this.beingUpdated) {
-          payload.folder_id = this.router.currentRoute.value.query.folder || "default";
+          payload.folder_id =
+            this.router.currentRoute.value.query.folder || "default";
           callAlert = alertsService.update_by_alert_id(
             this.store.state.selectedOrganization.identifier,
             payload,
-            this.activeFolderId
+            this.activeFolderId,
           );
           callAlert
             .then((res: { data: any }) => {
               this.formData = { ...defaultValue };
-              this.$emit("update:list");
+              this.$emit("update:list", this.activeFolderId);
               this.addAlertForm.resetValidation();
               dismiss();
+              this.isAlertSaving = false;
               this.q.notify({
                 type: "positive",
                 message: `Alert updated successfully.`,
               });
             })
             .catch((err: any) => {
+              this.isAlertSaving = false;
               dismiss();
               this.handleAlertError(err);
             });
@@ -1576,7 +1577,7 @@ export default defineComponent({
           callAlert = alertsService.create_by_alert_id(
             this.store.state.selectedOrganization.identifier,
             payload,
-            this.activeFolderId
+            this.activeFolderId,
           );
 
           callAlert
@@ -1585,12 +1586,14 @@ export default defineComponent({
               this.$emit("update:list", this.activeFolderId);
               this.addAlertForm.resetValidation();
               dismiss();
+              this.isAlertSaving = false;
               this.q.notify({
                 type: "positive",
                 message: `Alert saved successfully.`,
               });
             })
             .catch((err: any) => {
+              this.isAlertSaving = false;
               dismiss();
               this.handleAlertError(err);
             });

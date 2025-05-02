@@ -521,15 +521,24 @@ pub async fn get_cached_nodes(cond: fn(&Node) -> bool) -> Option<Vec<Node>> {
     )
 }
 
+pub async fn get_node_by_addr(addr: &str) -> Option<Node> {
+    let nodes = get_cached_nodes(|_| true).await.unwrap_or_default();
+    nodes.iter().find(|n| n.grpc_addr == addr).cloned()
+}
+
 #[inline(always)]
 pub async fn get_cached_node_by_name(name: &str) -> Option<Node> {
     let r = NODES.read().await;
     if r.is_empty() {
+        drop(r);
         return None;
     }
-    r.iter()
+    let node = r
+        .iter()
         .find(|(_uuid, node)| node.name == name)
-        .map(|(_uuid, node)| node.clone())
+        .map(|(_uuid, node)| node.clone());
+    drop(r);
+    node
 }
 
 #[inline(always)]
@@ -631,12 +640,9 @@ fn update_node_status_metrics() -> NodeMetrics {
     config::metrics::NODE_TCP_CONNECTIONS
         .with_label_values(&["time_wait"])
         .set(node_status.tcp_conns_time_wait as i64);
-    config::metrics::NODE_OPEN_FDS
-        .with_label_values(&[])
-        .set(node_status.open_fds as i64);
-    config::metrics::NODE_TCP_CONN_RESETS
-        .with_label_values(&[])
-        .set(node_status.tcp_conn_resets as i64);
+    config::metrics::NODE_TCP_CONNECTIONS
+        .with_label_values(&["resets"])
+        .set(node_status.tcp_conns_resets as i64);
 
     node_status
 }

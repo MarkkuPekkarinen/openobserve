@@ -68,7 +68,10 @@ use infra::{
 use ingester::WAL_PARQUET_METADATA;
 use once_cell::sync::Lazy;
 use parquet::arrow::async_reader::ParquetRecordBatchStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 
 use crate::{
     common::{
@@ -97,8 +100,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     // start worker threads
     let cfg = get_config();
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<(String, Vec<FileKey>)>(cfg.limit.file_move_thread_num);
+    let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<FileKey>)>(1);
     let rx = Arc::new(Mutex::new(rx));
     for thread_id in 0..cfg.limit.file_move_thread_num {
         let rx = rx.clone();
@@ -679,19 +681,24 @@ async fn merge_files(
     let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
     let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
     let index_fields = get_stream_setting_index_fields(&stream_settings);
-    let (defined_schema_fields, need_original) = match stream_settings {
-        Some(s) => (
-            s.defined_schema_fields.unwrap_or_default(),
-            s.store_original_data,
-        ),
-        None => (Vec::new(), false),
-    };
+    let (defined_schema_fields, need_original, index_original_data, index_all_values) =
+        match stream_settings {
+            Some(s) => (
+                s.defined_schema_fields.unwrap_or_default(),
+                s.store_original_data,
+                s.index_original_data,
+                s.index_all_values,
+            ),
+            None => (Vec::new(), false, false, false),
+        };
     let latest_schema = if !defined_schema_fields.is_empty() {
         let latest_schema = SchemaCache::new(latest_schema.as_ref().clone());
         let latest_schema = generate_schema_for_defined_schema_fields(
             &latest_schema,
             &defined_schema_fields,
             need_original,
+            index_original_data,
+            index_all_values,
         );
         latest_schema.schema().clone()
     } else {
@@ -796,6 +803,10 @@ async fn merge_files(
 
     // upload file
     let buf = Bytes::from(buf);
+    if cfg.cache_latest_files.cache_parquet && cfg.cache_latest_files.download_from_node {
+        infra::cache::file_data::disk::set(&new_file_key, buf.clone()).await?;
+        log::debug!("merge_files {new_file_key} file_data::disk::set success");
+    }
     storage::put(&new_file_key, buf.clone()).await?;
 
     // skip index generation if not enabled or not basic type
@@ -850,14 +861,14 @@ async fn merge_files(
         index_format,
         InvertedIndexFormat::Tantivy | InvertedIndexFormat::Both
     ) {
-        let (schema, mut reader) = get_recordbatch_reader_from_bytes(&buf).await?;
+        let (schema, reader) = get_recordbatch_reader_from_bytes(&buf).await?;
         let index_size = create_tantivy_index(
             "INGESTER",
             &new_file_key,
             &full_text_search_fields,
             &index_fields,
             schema,
-            &mut reader,
+            reader,
         )
         .await
         .map_err(|e| anyhow::anyhow!("generate_tantivy_index_on_ingester error: {}", e))?;
@@ -1330,10 +1341,9 @@ async fn prepare_index_record_batches(
                 }
                 ids.push(idx + prev_total_num_rows);
             }
-        }
 
-        // yield, this operation is time-consuming
-        tokio::task::yield_now().await;
+            tokio::task::coop::consume_budget().await;
+        }
     }
 
     // build record batch
@@ -1403,8 +1413,7 @@ async fn prepare_index_record_batches(
                 .map_err(|e| anyhow::anyhow!("RecordBatch::try_new error: {}", e))?;
                 indexed_record_batches_to_merge.push(record_batch);
 
-                // yield, this operation is time-consuming
-                tokio::task::yield_now().await;
+                tokio::task::coop::consume_budget().await;
             }
         }
     }
@@ -1418,7 +1427,7 @@ pub(crate) async fn create_tantivy_index(
     full_text_search_fields: &[String],
     index_fields: &[String],
     schema: Arc<Schema>,
-    reader: &mut ParquetRecordBatchStream<std::io::Cursor<Bytes>>,
+    reader: ParquetRecordBatchStream<std::io::Cursor<Bytes>>,
 ) -> Result<usize, anyhow::Error> {
     let start = std::time::Instant::now();
     let caller = format!("[{caller}:JOB]");
@@ -1435,7 +1444,6 @@ pub(crate) async fn create_tantivy_index(
     if index.is_none() {
         return Ok(0);
     }
-
     let puffin_bytes = dir.to_puffin_bytes()?;
     let index_size = puffin_bytes.len();
 
@@ -1444,6 +1452,15 @@ pub(crate) async fn create_tantivy_index(
     else {
         return Ok(0);
     };
+
+    if get_config().cache_latest_files.cache_index
+        && get_config().cache_latest_files.download_from_node
+    {
+        infra::cache::file_data::disk::set(&idx_file_name, Bytes::from(puffin_bytes.clone()))
+            .await?;
+        log::info!("file: {idx_file_name} file_data::disk::set success");
+    }
+
     match storage::put(&idx_file_name, Bytes::from(puffin_bytes)).await {
         Ok(_) => {
             log::info!(
@@ -1463,14 +1480,13 @@ pub(crate) async fn create_tantivy_index(
             return Err(e.into());
         }
     }
-
     Ok(index_size)
 }
 
 /// Create a tantivy index in the given directory for the record batch
 pub(crate) async fn generate_tantivy_index<D: tantivy::Directory>(
     tantivy_dir: D,
-    reader: &mut ParquetRecordBatchStream<std::io::Cursor<Bytes>>,
+    mut reader: ParquetRecordBatchStream<std::io::Cursor<Bytes>>,
     full_text_search_fields: &[String],
     index_fields: &[String],
     schema: Arc<Schema>,
@@ -1497,7 +1513,10 @@ pub(crate) async fn generate_tantivy_index<D: tantivy::Directory>(
         .iter()
         .map(|f| f.to_string())
         .collect::<HashSet<_>>();
-    let tantivy_fields = fts_fields.union(&index_fields).collect::<HashSet<_>>();
+    let tantivy_fields = fts_fields
+        .union(&index_fields)
+        .cloned()
+        .collect::<HashSet<_>>();
     // no fields need to create index, return
     if tantivy_fields.is_empty() {
         return Ok(None);
@@ -1525,87 +1544,94 @@ pub(crate) async fn generate_tantivy_index<D: tantivy::Directory>(
     let tantivy_schema = tantivy_schema_builder.build();
     let fts_field = tantivy_schema.get_field(INDEX_FIELD_NAME_FOR_ALL).ok();
 
-    let mut total_num_rows = 0;
-    // docs per row to be added in the tantivy index
-    let mut docs = BTreeMap::new();
-
-    loop {
-        let batch = reader.try_next().await?;
-        let Some(inverted_idx_batch) = batch else {
-            break;
-        };
-        let num_rows = inverted_idx_batch.num_rows();
-        if num_rows == 0 {
-            continue;
-        }
-
-        // update total_num_rows
-        let prev_total_num_rows = total_num_rows;
-        total_num_rows += num_rows;
-
-        // process full text search fields
-        for column_name in tantivy_fields.iter() {
-            let column_data = match inverted_idx_batch.column_by_name(column_name) {
-                Some(column_data) => match column_data.as_any().downcast_ref::<StringArray>() {
-                    Some(column_data) => column_data,
-                    None => {
-                        // generate empty array to ensure the tantivy and parquet have same rows
-                        &StringArray::from(vec![""; num_rows])
-                    }
-                },
-                None => {
-                    // generate empty array to ensure the tantivy and parquet have same rows
-                    &StringArray::from(vec![""; num_rows])
-                }
-            };
-
-            // get field
-            let field = match tantivy_schema.get_field(column_name) {
-                Ok(f) => f,
-                Err(_) => fts_field.unwrap(),
-            };
-            for i in 0..num_rows {
-                let doc = docs
-                    .entry(i + prev_total_num_rows)
-                    .or_insert(tantivy::doc!());
-                doc.add_text(field, column_data.value(i));
-            }
-        }
-
-        // yield, this operation is time-consuming
-        tokio::task::yield_now().await;
-    }
-
-    // no docs need to create index, return
-    if docs.is_empty() {
-        return Ok(None);
-    }
-
     let tokenizer_manager = tantivy::tokenizer::TokenizerManager::default();
     tokenizer_manager.register(O2_TOKENIZER, o2_tokenizer_build());
     let mut index_writer = tantivy::IndexBuilder::new()
-        .schema(tantivy_schema)
+        .schema(tantivy_schema.clone())
         .tokenizers(tokenizer_manager)
         .single_segment_index_writer(tantivy_dir, 50_000_000)
         .context("failed to create index builder")?;
 
-    for (_, doc) in docs.into_iter() {
-        if let Err(e) = index_writer.add_document(doc) {
-            log::error!(
-                "generate_tantivy_index: Failed to add document to index: {}",
-                e
-            );
-            return Err(anyhow::anyhow!("Failed to add document to index: {}", e));
+    // docs per row to be added in the tantivy index
+    log::debug!("start write documents to tantivy index");
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<tantivy::TantivyDocument>>(2);
+    let task: JoinHandle<Result<usize, anyhow::Error>> = tokio::task::spawn(async move {
+        let mut total_num_rows = 0;
+        loop {
+            let batch = reader.try_next().await?;
+            let Some(inverted_idx_batch) = batch else {
+                break;
+            };
+            let num_rows = inverted_idx_batch.num_rows();
+            if num_rows == 0 {
+                continue;
+            }
+
+            // update total_num_rows
+            total_num_rows += num_rows;
+
+            // process full text search fields
+            let mut docs = vec![tantivy::doc!(); num_rows];
+            for column_name in tantivy_fields.iter() {
+                let column_data = match inverted_idx_batch.column_by_name(column_name) {
+                    Some(column_data) => match column_data.as_any().downcast_ref::<StringArray>() {
+                        Some(column_data) => column_data,
+                        None => {
+                            // generate empty array to ensure the tantivy and parquet have same rows
+                            &StringArray::from(vec![""; num_rows])
+                        }
+                    },
+                    None => {
+                        // generate empty array to ensure the tantivy and parquet have same rows
+                        &StringArray::from(vec![""; num_rows])
+                    }
+                };
+
+                // get field
+                let field = match tantivy_schema.get_field(column_name) {
+                    Ok(f) => f,
+                    Err(_) => fts_field.unwrap(),
+                };
+                for (i, doc) in docs.iter_mut().enumerate() {
+                    doc.add_text(field, column_data.value(i));
+                    tokio::task::coop::consume_budget().await;
+                }
+            }
+
+            tx.send(docs).await?;
+        }
+        Ok(total_num_rows)
+    });
+
+    while let Some(docs) = rx.recv().await {
+        for doc in docs {
+            if let Err(e) = index_writer.add_document(doc) {
+                log::error!(
+                    "generate_tantivy_index: Failed to add document to index: {}",
+                    e
+                );
+                return Err(anyhow::anyhow!("Failed to add document to index: {}", e));
+            }
+            tokio::task::coop::consume_budget().await;
         }
     }
+    let total_num_rows = task.await??;
+    // no docs need to create index, return
+    if total_num_rows == 0 {
+        return Ok(None);
+    }
+    log::debug!("write documents to tantivy index success");
 
-    let index = index_writer.finalize().map_err(|e| {
-        log::error!(
-            "generate_tantivy_index: Failed to finalize the index writer: {}",
-            e
-        );
-        anyhow::anyhow!("Failed to finalize the index writer: {}", e)
-    })?;
+    let index = tokio::task::spawn_blocking(move || {
+        index_writer.finalize().map_err(|e| {
+            log::error!(
+                "generate_tantivy_index: Failed to finalize the index writer: {}",
+                e
+            );
+            anyhow::anyhow!("Failed to finalize the index writer: {}", e)
+        })
+    })
+    .await??;
 
     Ok(Some(index))
 }

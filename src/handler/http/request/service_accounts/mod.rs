@@ -37,6 +37,8 @@ use crate::{
 };
 
 /// ListServiceAccounts
+///
+/// #{"ratelimit_module":"Service Accounts", "ratelimit_module_operation":"list"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "ServiceAccounts",
@@ -89,6 +91,8 @@ pub async fn list(org_id: web::Path<String>, req: HttpRequest) -> Result<HttpRes
 }
 
 /// CreateServiceAccount
+///
+/// #{"ratelimit_module":"Service Accounts", "ratelimit_module_operation":"create"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "ServiceAccounts",
@@ -120,12 +124,15 @@ pub async fn save(
         password: generate_random_string(16),
         role: meta::user::UserRole::ServiceAccount,
         is_external: false,
+        token: None,
     };
 
     users::post_user(&org_id, user, &initiator_id).await
 }
 
 /// UpdateServiceAccount
+///
+/// #{"ratelimit_module":"Service Accounts", "ratelimit_module_operation":"update"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "ServiceAccounts",
@@ -204,6 +211,8 @@ pub async fn update(
 }
 
 /// RemoveServiceAccount
+///
+/// #{"ratelimit_module":"Service Accounts", "ratelimit_module_operation":"delete"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "ServiceAccounts",
@@ -231,6 +240,8 @@ pub async fn delete(
 }
 
 /// GetAPIToken
+///
+/// #{"ratelimit_module":"Service Accounts", "ratelimit_module_operation":"get"}#
 #[utoipa::path(
     context_path = "/api",
      tag = "ServiceAccounts",

@@ -22,7 +22,8 @@ use actix_web::web;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use config::{
-    BLOCKED_STREAMS, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, get_config,
+    ALL_VALUES_COL_NAME, BLOCKED_STREAMS, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
+    get_config,
     meta::{
         self_reporting::usage::UsageType,
         stream::{StreamParams, StreamType},
@@ -38,7 +39,7 @@ use crate::{
         format_stream_name,
         ingestion::check_ingestion_allowed,
         pipeline::batch_execution::{ExecutablePipeline, ExecutablePipelineBulkInputs},
-        schema::get_upto_discard_error,
+        schema::{get_future_discard_error, get_upto_discard_error},
     },
 };
 
@@ -69,6 +70,8 @@ pub async fn ingest(
     let cfg = get_config();
     let min_ts = (Utc::now() - Duration::try_hours(cfg.limit.ingest_allowed_upto).unwrap())
         .timestamp_micros();
+    let max_ts = (Utc::now() + Duration::try_hours(cfg.limit.ingest_allowed_in_future).unwrap())
+        .timestamp_micros();
 
     let log_ingestion_errors = ingestion_log_enabled().await;
     let mut action = String::from("");
@@ -83,6 +86,7 @@ pub async fn ingest(
 
     let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
     let mut streams_need_original_map: HashMap<String, bool> = HashMap::new();
+    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::new();
     let mut store_original_when_pipeline_exists = false;
 
     let mut json_data_by_stream = HashMap::new();
@@ -170,6 +174,7 @@ pub async fn ingest(
                 &streams,
                 &mut user_defined_schema_map,
                 &mut streams_need_original_map,
+                &mut streams_need_all_values_map,
             )
             .await;
 
@@ -255,6 +260,31 @@ pub async fn ingest(
                     );
                 }
 
+                // add `_all_values` if required by StreamSettings
+                if streams_need_all_values_map
+                    .get(&stream_name)
+                    .is_some_and(|v| *v)
+                {
+                    let mut values = Vec::with_capacity(local_val.len());
+                    for (k, value) in local_val.iter() {
+                        if [
+                            TIMESTAMP_COL_NAME,
+                            ID_COL_NAME,
+                            ORIGINAL_DATA_COL_NAME,
+                            ALL_VALUES_COL_NAME,
+                        ]
+                        .contains(&k.as_str())
+                        {
+                            continue;
+                        }
+                        values.push(value.to_string());
+                    }
+                    local_val.insert(
+                        ALL_VALUES_COL_NAME.to_string(),
+                        json::Value::String(values.join(" ")),
+                    );
+                }
+
                 // handle timestamp
                 let timestamp = match local_val.get(TIMESTAMP_COL_NAME) {
                     Some(v) => match parse_timestamp_micro_from_value(v) {
@@ -286,9 +316,13 @@ pub async fn ingest(
                 };
 
                 // check ingestion time
-                if timestamp < min_ts {
+                if timestamp < min_ts || timestamp > max_ts {
                     bulk_res.errors = true;
-                    let failure_reason = Some(get_upto_discard_error().to_string());
+                    let failure_reason = if timestamp < min_ts {
+                        Some(get_upto_discard_error().to_string())
+                    } else {
+                        Some(get_future_discard_error().to_string())
+                    };
                     metrics::INGEST_ERRORS
                         .with_label_values(&[
                             org_id,
@@ -321,6 +355,7 @@ pub async fn ingest(
                 *fn_num = Some(0); // no pl -> no func
             }
         }
+        tokio::task::coop::consume_budget().await;
     }
 
     // batch process records through pipeline
@@ -379,6 +414,7 @@ pub async fn ingest(
                                 &[stream_params],
                                 &mut user_defined_schema_map,
                                 &mut streams_need_original_map,
+                                &mut streams_need_all_values_map,
                             )
                             .await;
                         }
@@ -425,6 +461,31 @@ pub async fn ingest(
                                 );
                             }
 
+                            // add `_all_values` if required by StreamSettings
+                            if streams_need_all_values_map
+                                .get(&destination_stream)
+                                .is_some_and(|v| *v)
+                            {
+                                let mut values = Vec::with_capacity(local_val.len());
+                                for (k, value) in local_val.iter() {
+                                    if [
+                                        TIMESTAMP_COL_NAME,
+                                        ID_COL_NAME,
+                                        ORIGINAL_DATA_COL_NAME,
+                                        ALL_VALUES_COL_NAME,
+                                    ]
+                                    .contains(&k.as_str())
+                                    {
+                                        continue;
+                                    }
+                                    values.push(value.to_string());
+                                }
+                                local_val.insert(
+                                    ALL_VALUES_COL_NAME.to_string(),
+                                    json::Value::String(values.join(" ")),
+                                );
+                            }
+
                             // handle timestamp
                             let timestamp = match local_val.get(TIMESTAMP_COL_NAME) {
                                 Some(v) => match parse_timestamp_micro_from_value(v) {
@@ -460,9 +521,13 @@ pub async fn ingest(
                             };
 
                             // check ingestion time
-                            if timestamp < min_ts {
+                            if timestamp < min_ts || timestamp > max_ts {
                                 bulk_res.errors = true;
-                                let failure_reason = Some(get_upto_discard_error().to_string());
+                                let failure_reason = if timestamp < min_ts {
+                                    Some(get_upto_discard_error().to_string())
+                                } else {
+                                    Some(get_future_discard_error().to_string())
+                                };
                                 metrics::INGEST_ERRORS
                                     .with_label_values(&[
                                         org_id,
@@ -492,7 +557,9 @@ pub async fn ingest(
                                 .entry(destination_stream.clone())
                                 .or_insert((Vec::new(), None));
                             ts_data.push((timestamp, local_val));
-                            *fn_num = Some(function_no)
+                            *fn_num = Some(function_no);
+
+                            tokio::task::coop::consume_budget().await;
                         }
                     }
                 }
@@ -503,6 +570,7 @@ pub async fn ingest(
     // drop memory-intensive variables
     drop(stream_pipeline_inputs);
     drop(streams_need_original_map);
+    drop(streams_need_all_values_map);
     drop(user_defined_schema_map);
 
     let (metric_rpt_status_code, response_body) = {

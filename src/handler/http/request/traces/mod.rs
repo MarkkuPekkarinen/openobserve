@@ -88,6 +88,8 @@ async fn handle_req(
 }
 
 /// GetLatestTraces
+///
+/// #{"ratelimit_module":"Traces", "ratelimit_module_operation":"list"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Traces",
@@ -238,30 +240,6 @@ pub async fn get_latest_traces(
     let timeout = query
         .get("timeout")
         .map_or(0, |v| v.parse::<i64>().unwrap_or(0));
-
-    metrics::QUERY_PENDING_NUMS
-        .with_label_values(&[&org_id])
-        .inc();
-    // get a local search queue lock
-    #[cfg(not(feature = "enterprise"))]
-    let locker = SearchService::QUEUE_LOCKER.clone();
-    #[cfg(not(feature = "enterprise"))]
-    let locker = locker.lock().await;
-    #[cfg(not(feature = "enterprise"))]
-    if !cfg.common.feature_query_queue_enabled {
-        drop(locker);
-    }
-    #[cfg(not(feature = "enterprise"))]
-    let took_wait = start.elapsed().as_millis() as usize;
-    #[cfg(feature = "enterprise")]
-    let took_wait = 0;
-    log::info!(
-        "http traces latest API wait in queue took: {} ms",
-        took_wait
-    );
-    metrics::QUERY_PENDING_NUMS
-        .with_label_values(&[&org_id])
-        .dec();
 
     // search
     let query_sql = format!(

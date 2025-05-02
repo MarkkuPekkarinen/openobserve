@@ -31,8 +31,9 @@ use strum::IntoEnumIterator;
 use {
     crate::common::utils::auth::check_permissions,
     crate::service::self_reporting::audit,
+    config::utils::time::now_micros,
     o2_dex::config::get_config as get_dex_config,
-    o2_enterprise::enterprise::common::auditor::{AuditMessage, HttpMeta, Protocol},
+    o2_enterprise::enterprise::common::auditor::{AuditMessage, Protocol, ResponseMeta},
     o2_openfga::config::get_config as get_openfga_config,
 };
 
@@ -53,6 +54,8 @@ use crate::{
 pub mod service_accounts;
 
 /// ListUsers
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"list"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Users",
@@ -91,6 +94,8 @@ pub async fn list(org_id: web::Path<String>, user_email: UserEmail) -> Result<Ht
 }
 
 /// CreateUser
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"create"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Users",
@@ -133,6 +138,8 @@ pub async fn save(
 }
 
 /// UpdateUser
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"update"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Users",
@@ -179,6 +186,8 @@ pub async fn update(
 }
 
 /// AddUserToOrganization
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"create"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Users",
@@ -214,6 +223,7 @@ fn _prepare_cookie<'a, T: Serialize + ?Sized, E: Into<cookie::Expiration>>(
     cookie_expiry: E,
 ) -> cookie::Cookie<'a> {
     let tokens = json::to_string(token_struct).unwrap();
+    let tokens = base64::encode(&tokens);
     let mut auth_cookie = cookie::Cookie::new(cookie_name, tokens);
     auth_cookie.set_expires(cookie_expiry.into());
     auth_cookie.set_http_only(true);
@@ -227,6 +237,8 @@ fn _prepare_cookie<'a, T: Serialize + ?Sized, E: Into<cookie::Expiration>>(
     auth_cookie
 }
 /// RemoveUserFromOrganization
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"delete"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Users",
@@ -254,6 +266,8 @@ pub async fn delete(
 }
 
 /// AuthenticateUser
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"update"}#
 #[utoipa::path(
     context_path = "/auth",
     tag = "Auth",
@@ -282,14 +296,17 @@ pub async fn authentication(
     let mut audit_message = AuditMessage {
         user_email: "".to_string(),
         org_id: "".to_string(),
-        _timestamp: chrono::Utc::now().timestamp_micros(),
-        protocol: Protocol::Http(HttpMeta {
-            method: "POST".to_string(),
-            path: "/auth/login".to_string(),
-            body: "".to_string(),
-            query_params: _req.query_string().to_string(),
-            response_code: 200,
-        }),
+        _timestamp: now_micros(),
+        protocol: Protocol::Http,
+        response_meta: ResponseMeta {
+            http_method: "POST".to_string(),
+            http_path: "/auth/login".to_string(),
+            http_body: "".to_string(),
+            http_query_params: _req.query_string().to_string(),
+            http_response_code: 200,
+            error_msg: None,
+            trace_id: None,
+        },
     };
 
     let mut resp = SignInResponse::default();
@@ -365,6 +382,7 @@ pub async fn authentication(
         })
         .unwrap();
 
+        let tokens = base64::encode(&tokens);
         let mut auth_cookie = cookie::Cookie::new("auth_tokens", tokens);
         auth_cookie.set_expires(
             cookie::time::OffsetDateTime::now_utc()
@@ -430,14 +448,17 @@ pub async fn get_presigned_url(
         let audit_message = AuditMessage {
             user_email: basic_auth.user_id().to_string(),
             org_id: "".to_string(),
-            _timestamp: chrono::Utc::now().timestamp_micros(),
-            protocol: Protocol::Http(HttpMeta {
-                method: "GET".to_string(),
-                path: "/auth/presigned-url".to_string(),
-                body: "".to_string(),
-                query_params: _req.query_string().to_string(),
-                response_code: 200,
-            }),
+            _timestamp: now_micros(),
+            protocol: Protocol::Http,
+            response_meta: ResponseMeta {
+                http_method: "GET".to_string(),
+                http_path: "/auth/presigned-url".to_string(),
+                http_body: "".to_string(),
+                http_query_params: _req.query_string().to_string(),
+                http_response_code: 200,
+                error_msg: None,
+                trace_id: None,
+            },
         };
         audit(audit_message).await;
     }
@@ -469,15 +490,18 @@ pub async fn get_auth(_req: HttpRequest) -> Result<HttpResponse, Error> {
         let mut audit_message = AuditMessage {
             user_email: "".to_string(),
             org_id: "".to_string(),
-            _timestamp: chrono::Utc::now().timestamp_micros(),
-            protocol: Protocol::Http(HttpMeta {
-                method: "GET".to_string(),
-                path: "/auth/login".to_string(),
-                body: "".to_string(),
+            _timestamp: now_micros(),
+            protocol: Protocol::Http,
+            response_meta: ResponseMeta {
+                http_method: "GET".to_string(),
+                http_path: "/auth/login".to_string(),
+                http_body: "".to_string(),
                 // Don't include query string as it may contain the auth token
-                query_params: "".to_string(),
-                response_code: 302,
-            }),
+                http_query_params: "".to_string(),
+                http_response_code: 302,
+                error_msg: None,
+                trace_id: None,
+            },
         };
 
         let (name, password) = {
@@ -636,7 +660,9 @@ pub async fn get_auth(_req: HttpRequest) -> Result<HttpResponse, Error> {
     }
 }
 
-/// ListUsers
+/// ListUserRoles
+///
+/// #{"ratelimit_module":"Users", "ratelimit_module_operation":"list"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Users",
@@ -683,9 +709,7 @@ async fn audit_unauthorized_error(mut audit_message: AuditMessage) {
     use chrono::Utc;
 
     audit_message._timestamp = Utc::now().timestamp_micros();
-    if let Protocol::Http(http_meta) = &mut audit_message.protocol {
-        http_meta.response_code = 401;
-    }
+    audit_message.response_meta.http_response_code = 401;
     // Even if the user_email of audit_message is not set, still the event should be audited
     audit(audit_message).await;
 }

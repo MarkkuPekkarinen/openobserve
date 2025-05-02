@@ -19,6 +19,7 @@ use ::config::{
         cluster::{Role, RoleGroup},
         promql::RequestRangeQuery,
     },
+    router::{INGESTER_ROUTES, is_fixed_querier_route, is_querier_route, is_querier_route_by_body},
     utils::rand::get_rand_element,
 };
 use actix_web::{
@@ -27,57 +28,11 @@ use actix_web::{
     route, web,
 };
 use hashbrown::HashMap;
-pub use ws_v2::remove_querier_from_handler;
+pub use ws::remove_querier_from_handler;
 
 use crate::common::{infra::cluster, utils::http::get_search_type_from_request};
 
-mod ws;
-pub(crate) mod ws_v2;
-
-/// usize indicates the number of parts to skip based on their actual paths.
-const QUERIER_ROUTES: [(&str, usize); 21] = [
-    ("config", 0),                            // /config
-    ("summary", 2),                           // /api/{org_id}/summary
-    ("organizations", 1),                     // /api/organizations
-    ("settings", 2),                          // /api/{org_id}/settings/...
-    ("schema", 3),                            // /api/{org_id}/streams/{stream_name}/schema
-    ("streams", 2),                           // /api/{org_id}/streams/...
-    ("traces/latest", 3),                     // /api/{org_id}/{stream_name}/traces/latest
-    ("clusters", 1),                          // /api/clusters
-    ("query_manager", 2),                     // /api/{org_id}/query_manager/...
-    ("ws", 2),                                // /api/{org_id}/ws
-    ("_search", 2),                           // /api/{org_id}/_search
-    ("_around", 3),                           // /api/{org_id}/{stream_name}/_around
-    ("_values", 3),                           // /api/{org_id}/{stream_name}/_values
-    ("functions?page_num=", 2),               // /api/{org_id}/functions
-    ("prometheus/api/v1/series", 2),          // /api/{org_id}/prometheus/api/v1/series
-    ("prometheus/api/v1/query", 2),           // /api/{org_id}/prometheus/api/v1/query
-    ("prometheus/api/v1/query_range", 2),     // /api/{org_id}/prometheus/api/v1/query_range
-    ("prometheus/api/v1/query_exemplars", 2), // /api/{org_id}/prometheus/api/v1/query_exemplars
-    ("prometheus/api/v1/metadata", 2),        // /api/{org_id}/prometheus/api/v1/metadata
-    ("prometheus/api/v1/labels", 2),          // /api/{org_id}/prometheus/api/v1/labels
-    ("prometheus/api/v1/label/", 2),          /* /api/{org_id}/prometheus/api/v1/label/
-                                               * {label_name}/
-                                               * values */
-];
-const QUERIER_ROUTES_BY_BODY: [&str; 2] = [
-    "/prometheus/api/v1/query_range",
-    "/prometheus/api/v1/query_exemplars",
-];
-const FIXED_QUERIER_ROUTES: [&str; 3] = ["/summary", "/schema", "/streams"];
-const INGESTER_ROUTES: [&str; 11] = [
-    "/_bulk",
-    "/_multi",
-    "/_json",
-    "/_kinesis_firehose",
-    "/_sub",
-    "/v1/logs",
-    "/ingest/metrics/_json",
-    "/v1/metrics",
-    "/traces",
-    "/v1/traces",
-    "/traces/latest",
-];
+pub(crate) mod ws;
 
 struct URLDetails {
     is_error: bool,
@@ -85,39 +40,6 @@ struct URLDetails {
     path: String,
     full_url: String,
     node_addr: String,
-}
-
-#[inline]
-fn is_querier_route(path: &str) -> bool {
-    QUERIER_ROUTES.iter().any(|(route, skip_segments)| {
-        if path.contains(route) {
-            let segments = path
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>();
-            // check if we have enough segments
-            if segments.len() <= *skip_segments {
-                return false;
-            }
-            let route_part = segments[*skip_segments..].join("/");
-            route_part.starts_with(route)
-                && INGESTER_ROUTES
-                    .iter()
-                    .all(|ingest_route| !route_part.ends_with(ingest_route))
-        } else {
-            false
-        }
-    })
-}
-
-#[inline]
-fn is_querier_route_by_body(path: &str) -> bool {
-    QUERIER_ROUTES_BY_BODY.iter().any(|x| path.contains(x))
-}
-
-#[inline]
-fn is_fixed_querier_route(path: &str) -> bool {
-    FIXED_QUERIER_ROUTES.iter().any(|x| path.contains(x))
 }
 
 #[route(
@@ -233,8 +155,12 @@ async fn dispatch(
 
     // check if the request is a websocket request
     let path_columns: Vec<&str> = path.split('/').collect();
-    if path_columns.get(3).unwrap_or(&"").starts_with("ws") {
-        return proxy_ws(req, payload, new_url, start).await;
+    if *path_columns.get(3).unwrap_or(&"") == "ws"
+        && INGESTER_ROUTES
+            .iter()
+            .all(|ingest_route| !path.ends_with(ingest_route))
+    {
+        return proxy_ws(req, payload, start).await;
     }
 
     // check if the request need to be proxied by body
@@ -253,7 +179,7 @@ async fn get_url(path: &str) -> URLDetails {
     let nodes = if is_querier_path {
         node_type = Role::Querier;
         let query_str = path[path.find("?").unwrap_or(path.len())..].to_string();
-        let node_group = web::Query::<HashMap<String, String>>::from_query(&query_str)
+        let role_group = web::Query::<HashMap<String, String>>::from_query(&query_str)
             .map(|query_params| {
                 get_search_type_from_request(&query_params)
                     .unwrap_or(None)
@@ -261,7 +187,7 @@ async fn get_url(path: &str) -> URLDetails {
                     .unwrap_or(RoleGroup::Interactive)
             })
             .unwrap_or(RoleGroup::Interactive);
-        let nodes = cluster::get_cached_online_querier_nodes(Some(node_group)).await;
+        let nodes = cluster::get_cached_online_querier_nodes(Some(role_group)).await;
         if is_fixed_querier_route(path) && nodes.is_some() && !nodes.as_ref().unwrap().is_empty() {
             nodes.map(|v| v.into_iter().take(1).collect())
         } else {
@@ -460,7 +386,6 @@ async fn proxy_querier_by_body(
 async fn proxy_ws(
     req: HttpRequest,
     payload: web::Payload,
-    new_url: URLDetails,
     start: std::time::Instant,
 ) -> actix_web::Result<HttpResponse, Error> {
     let cfg = get_config();
@@ -475,49 +400,26 @@ async fn proxy_ws(
             let client_id = path_parts[path_parts.len() - 1].to_string();
 
             log::info!(
-                "[WS_V2_ROUTER] Handling WS v2 connection for client: {}, took: {} ms",
+                "[WS_ROUTER] Handling WS connection for client: {}, took: {} ms",
                 client_id,
                 start.elapsed().as_millis()
             );
 
             // Use the WebSocket v2 handler
-            let ws_handler = ws_v2::get_ws_handler().await;
+            let ws_handler = ws::get_ws_handler().await;
             match ws_handler.handle_connection(req, payload, client_id).await {
                 Ok(response) => Ok(response),
                 Err(e) => {
-                    log::error!("[WS_V2_ROUTER] failed: {}", e);
+                    log::error!("[WS_ROUTER] failed: {}", e);
                     Ok(HttpResponse::InternalServerError().body("WebSocket v2 error"))
                 }
             }
         } else {
-            // Use the legacy WebSocket proxy implementation
-            // Convert the HTTP/HTTPS URL to a WebSocket URL (WS/WSS)
-            let ws_url = match ws::convert_to_websocket_url(&new_url.full_url) {
-                Ok(url) => url,
-                Err(e) => {
-                    log::error!("Error converting URL to WebSocket: {:?}", e);
-                    return Ok(HttpResponse::BadRequest()
-                        .force_close()
-                        .body("Invalid WebSocket URL"));
-                }
-            };
-
-            match ws::ws_proxy(req, payload, &ws_url).await {
-                Ok(res) => {
-                    log::info!(
-                        "[WS_ROUTER] Successfully proxied WebSocket connection to backend: {}, took: {} ms",
-                        ws_url,
-                        start.elapsed().as_millis()
-                    );
-                    Ok(res)
-                }
-                Err(e) => {
-                    log::error!("[WS_ROUTER] failed: {:?}", e);
-                    Ok(HttpResponse::InternalServerError()
-                        .force_close()
-                        .body("WebSocket proxy error"))
-                }
-            }
+            log::info!(
+                "[WS_ROUTER]: Node Role: {} Websocket is disabled",
+                cfg.common.node_role
+            );
+            Ok(HttpResponse::NotFound().body("WebSocket is disabled"))
         }
     } else {
         log::info!(

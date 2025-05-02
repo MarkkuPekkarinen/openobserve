@@ -2961,6 +2961,7 @@ mod tests {
             auth: config::Auth {
                 root_user_email: String::default(),
                 root_user_password: String::default(),
+                root_user_token: String::default(),
                 cookie_max_age: i64::default(),
                 cookie_same_site_lax: bool::default(),
                 cookie_secure_only: bool::default(),
@@ -3005,7 +3006,8 @@ mod tests {
                 session_max_lifetime_secs: i64::default(),
                 session_gc_interval_secs: i64::default(),
                 ping_interval_secs: i64::default(),
-                check_cookie_expiry: bool::default(),
+                max_frame_size: usize::default(),
+                max_continuation_size: usize::default(),
             },
             route: config::Route {
                 timeout: u64::default(),
@@ -3089,7 +3091,7 @@ mod tests {
                 usage_publish_interval: i64::default(),
                 mmdb_data_dir: String::default(),
                 mmdb_disable_download: bool::default(),
-                mmdb_update_duration: u64::default(),
+                mmdb_update_duration_days: u64::default(),
                 mmdb_geolite_citydb_url: String::default(),
                 mmdb_geolite_asndb_url: String::default(),
                 mmdb_geolite_citydb_sha256_url: String::default(),
@@ -3133,6 +3135,8 @@ mod tests {
                 swagger_enabled: bool::default(),
                 fake_es_version: String::default(),
                 min_auto_refresh_interval: u32::default(),
+                feature_ingester_none_compression: bool::default(),
+                ingestion_url: String::default(),
             },
             limit: config::Limit {
                 cpu_num: usize::default(),
@@ -3175,6 +3179,7 @@ mod tests {
                 circuit_breaker_reset_window_num: i64::default(),
                 circuit_breaker_slow_request_threshold: u64::default(),
                 ingest_allowed_upto: i64::default(),
+                ingest_allowed_in_future: i64::default(),
                 ingest_flatten_level: u32::default(),
                 ignore_file_retention_by_stream: bool::default(),
                 logs_file_retention: String::default(),
@@ -3243,6 +3248,7 @@ mod tests {
                 inverted_index_skip_threshold: usize::default(),
                 max_query_range_for_sa: i64::default(),
                 db_text_data_type: String::default(),
+                search_mini_partition_duration_secs: u64::default(),
             },
             compact: config::Compact {
                 enabled: bool::default(),
@@ -3264,12 +3270,18 @@ mod tests {
                 job_run_timeout: i64::default(),
                 job_clean_wait_time: i64::default(),
                 pending_jobs_metric_interval: u64::default(),
+                max_group_files: usize::default(),
+            },
+            cache_latest_files: config::CacheLatestFiles {
+                enabled: bool::default(),
+                cache_parquet: bool::default(),
+                cache_index: bool::default(),
+                delete_merge_files: bool::default(),
             },
             memory_cache: config::MemoryCache {
                 enabled: bool::default(),
                 cache_strategy: String::default(),
                 bucket_num: 1,
-                cache_latest_files: bool::default(),
                 max_size: usize::default(),
                 skip_size: usize::default(),
                 release_size: usize::default(),
@@ -3428,6 +3440,10 @@ mod tests {
             encryption: config::Encryption {
                 algorithm: String::default(),
                 master_key: String::default(),
+            },
+            ratelimit: config::RateLimit {
+                ratelimit_rule_refresh_interval: 0,
+                ratelimit_enabled: false,
             },
         }
     }

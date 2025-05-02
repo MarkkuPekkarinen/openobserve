@@ -81,10 +81,15 @@ pub const MINIMUM_DB_CONNECTIONS: u32 = 2;
 pub const REQUIRED_DB_CONNECTIONS: u32 = 4;
 
 // Columns added to ingested records for _INTERNAL_ use only.
-// Used for storing and querying unflattened original data
-pub const ORIGINAL_DATA_COL_NAME: &str = "_original";
-pub const ID_COL_NAME: &str = "_o2_id";
 pub const TIMESTAMP_COL_NAME: &str = "_timestamp";
+// Used for storing and querying unflattened original data
+pub const ID_COL_NAME: &str = "_o2_id";
+pub const ORIGINAL_DATA_COL_NAME: &str = "_original";
+pub const ALL_VALUES_COL_NAME: &str = "_all_values";
+
+// for DDL commands and migrations
+pub const DB_SCHEMA_VERSION: u64 = 1;
+pub const DB_SCHEMA_KEY: &str = "/db_schema_version/";
 
 const _DEFAULT_SQL_FULL_TEXT_SEARCH_FIELDS: [&str; 7] =
     ["log", "message", "msg", "content", "data", "body", "json"];
@@ -399,6 +404,7 @@ pub struct Config {
     pub common: Common,
     pub limit: Limit,
     pub compact: Compact,
+    pub cache_latest_files: CacheLatestFiles,
     pub memory_cache: MemoryCache,
     pub disk_cache: DiskCache,
     pub log: Log,
@@ -428,14 +434,20 @@ pub struct WebSocket {
     pub session_max_lifetime_secs: i64,
     #[env_config(name = "ZO_WEBSOCKET_SESSION_GC_INTERVAL_SECS", default = 60)]
     pub session_gc_interval_secs: i64,
-    #[env_config(name = "ZO_WEBSOCKET_PING_INTERVAL_SECS", default = 15)]
+    #[env_config(name = "ZO_WEBSOCKET_PING_INTERVAL_SECS", default = 30)]
     pub ping_interval_secs: i64,
-    #[env_config(name = "ZO_WEBSOCKET_CHECK_COOKIE_EXPIRY", default = true)]
-    pub check_cookie_expiry: bool,
-    #[env_config(name = "ZO_WEBSOCKET_HEALTH_CHECK_INTERVAL_SECS", default = 60)]
-    pub health_check_interval: i64,
-    #[env_config(name = "ZO_WEBSOCKET_IS_SESSION_DRAIN_ENABLED", default = false)]
-    pub is_session_drain_enabled: bool,
+    #[env_config(
+        name = "ZO_WEBSOCKET_MAX_FRAME_SIZE",
+        default = 1,
+        help = "Maximum allowed frame size in MB"
+    )]
+    pub max_frame_size: usize,
+    #[env_config(
+        name = "ZO_WEBSOCKET_MAX_CONTINUATION_SIZE",
+        default = 256,
+        help = "Maximum allowed continuation size in MB"
+    )]
+    pub max_continuation_size: usize,
 }
 
 #[derive(EnvConfig)]
@@ -554,6 +566,8 @@ pub struct Auth {
     pub root_user_email: String,
     #[env_config(name = "ZO_ROOT_USER_PASSWORD")]
     pub root_user_password: String,
+    #[env_config(name = "ZO_ROOT_USER_TOKEN")]
+    pub root_user_token: String,
     #[env_config(name = "ZO_COOKIE_MAX_AGE", default = 2592000)] // seconds, 30 days
     pub cookie_max_age: i64,
     #[env_config(name = "ZO_COOKIE_SAME_SITE_LAX", default = true)]
@@ -662,6 +676,8 @@ pub struct Common {
     pub meta_mysql_dsn: String, // mysql://root:12345678@localhost:3306/openobserve
     #[env_config(name = "ZO_META_MYSQL_RO_DSN", default = "")]
     pub meta_mysql_ro_dsn: String, // mysql://root:12345678@readonly:3306/openobserve
+    #[env_config(name = "ZO_META_DDL_DSN", default = "")]
+    pub meta_ddl_dsn: String, // same db as meta store, but user with ddl perms
     #[env_config(name = "ZO_NODE_ROLE", default = "all")]
     pub node_role: String,
     #[env_config(
@@ -728,7 +744,7 @@ pub struct Common {
     pub feature_query_without_index: bool,
     #[env_config(name = "ZO_FEATURE_QUERY_REMOVE_FILTER_WITH_INDEX", default = true)]
     pub feature_query_remove_filter_with_index: bool,
-    #[env_config(name = "ZO_FEATURE_QUERY_STREAMING_AGGS", default = false)]
+    #[env_config(name = "ZO_FEATURE_QUERY_STREAMING_AGGS", default = true)]
     pub feature_query_streaming_aggs: bool,
     #[env_config(name = "ZO_FEATURE_JOIN_MATCH_ONE_ENABLED", default = false)]
     pub feature_join_match_one_enabled: bool,
@@ -851,8 +867,8 @@ pub struct Common {
     pub mmdb_data_dir: String,
     #[env_config(name = "ZO_MMDB_DISABLE_DOWNLOAD", default = false)]
     pub mmdb_disable_download: bool,
-    #[env_config(name = "ZO_MMDB_UPDATE_DURATION", default = "86400")] // Everyday to test
-    pub mmdb_update_duration: u64,
+    #[env_config(name = "ZO_MMDB_UPDATE_DURATION_DAYS", default = 30)] // default 30 days
+    pub mmdb_update_duration_days: u64,
     #[env_config(
         name = "ZO_MMDB_GEOLITE_CITYDB_URL",
         default = "https://geoip.zinclabs.dev/GeoLite2-City.mmdb"
@@ -1063,6 +1079,14 @@ pub struct Common {
     pub min_auto_refresh_interval: u32,
     #[env_config(name = "ZO_ADDITIONAL_REPORTING_ORGS", default = "")]
     pub additional_reporting_orgs: String,
+    #[env_config(name = "ZO_FILE_LIST_DUMP_ENABLED", default = false)]
+    pub file_list_dump_enabled: bool,
+    #[env_config(name = "ZO_FILE_LIST_DUMP_DUAL_WRITE", default = true)]
+    pub file_list_dump_dual_write: bool,
+    #[env_config(name = "ZO_FILE_LIST_DUMP_MIN_HOUR", default = 2)]
+    pub file_list_dump_min_hour: usize,
+    #[env_config(name = "ZO_FILE_LIST_DUMP_DEBUG_CHECK", default = true)]
+    pub file_list_dump_debug_check: bool,
 }
 
 #[derive(EnvConfig)]
@@ -1154,6 +1178,8 @@ pub struct Limit {
     pub query_group_base_speed: usize,
     #[env_config(name = "ZO_INGEST_ALLOWED_UPTO", default = 5)] // in hours - in past
     pub ingest_allowed_upto: i64,
+    #[env_config(name = "ZO_INGEST_ALLOWED_IN_FUTURE", default = 24)] // in hours - in future
+    pub ingest_allowed_in_future: i64,
     #[env_config(name = "ZO_INGEST_FLATTEN_LEVEL", default = 3)] // default flatten level
     pub ingest_flatten_level: u32,
     #[env_config(name = "ZO_IGNORE_FILE_RETENTION_BY_STREAM", default = false)]
@@ -1388,6 +1414,18 @@ pub struct Limit {
         help = "maximum series to display in charts"
     )]
     pub max_dashboard_series: usize,
+    #[env_config(
+        name = "ZO_SEARCH_MINI_PARTITION_DURATION_SECS",
+        default = 60,
+        help = "Duration of each mini search partition in seconds"
+    )]
+    pub search_mini_partition_duration_secs: u64,
+    #[env_config(
+        name = "ZO_HISTOGRAM_ENABLED",
+        help = "Show histogram for logs page",
+        default = true
+    )]
+    pub histogram_enabled: bool,
 }
 
 #[derive(EnvConfig)]
@@ -1448,17 +1486,31 @@ pub struct Compact {
 }
 
 #[derive(EnvConfig)]
+pub struct CacheLatestFiles {
+    #[env_config(name = "ZO_CACHE_LATEST_FILES_ENABLED", default = false)]
+    pub enabled: bool,
+    // cache parquet files
+    #[env_config(name = "ZO_CACHE_LATEST_FILES_PARQUET", default = true)]
+    pub cache_parquet: bool,
+    // cache index(tantivy) files
+    #[env_config(name = "ZO_CACHE_LATEST_FILES_INDEX", default = true)]
+    pub cache_index: bool,
+    #[env_config(name = "ZO_CACHE_LATEST_FILES_DELETE_MERGE_FILES", default = false)]
+    pub delete_merge_files: bool,
+    #[env_config(name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_FROM_NODE", default = false)]
+    pub download_from_node: bool,
+}
+
+#[derive(EnvConfig)]
 pub struct MemoryCache {
     #[env_config(name = "ZO_MEMORY_CACHE_ENABLED", default = true)]
     pub enabled: bool,
-    // Memory data cache strategy, default is lru, other value is fifo
+    // Memory data cache strategy, default is lru, other value is fifo, time_lru
     #[env_config(name = "ZO_MEMORY_CACHE_STRATEGY", default = "lru")]
     pub cache_strategy: String,
     // Memory data cache bucket num, multiple bucket means multiple locker, default is 0
     #[env_config(name = "ZO_MEMORY_CACHE_BUCKET_NUM", default = 0)]
     pub bucket_num: usize,
-    #[env_config(name = "ZO_MEMORY_CACHE_CACHE_LATEST_FILES", default = false)]
-    pub cache_latest_files: bool,
     // MB, default is 50% of system memory
     #[env_config(name = "ZO_MEMORY_CACHE_MAX_SIZE", default = 0)]
     pub max_size: usize,
@@ -1486,7 +1538,7 @@ pub struct MemoryCache {
 pub struct DiskCache {
     #[env_config(name = "ZO_DISK_CACHE_ENABLED", default = true)]
     pub enabled: bool,
-    // Disk data cache strategy, default is lru, other value is fifo
+    // Disk data cache strategy, default is lru, other value is fifo, time_lru
     #[env_config(name = "ZO_DISK_CACHE_STRATEGY", default = "lru")]
     pub cache_strategy: String,
     // Disk data cache bucket num, multiple bucket means multiple locker, default is 0
@@ -1643,6 +1695,8 @@ pub struct S3 {
     pub feature_http1_only: bool,
     #[env_config(name = "ZO_S3_FEATURE_HTTP2_ONLY", default = false)]
     pub feature_http2_only: bool,
+    #[env_config(name = "ZO_S3_FEATURE_BULK_DELETE", default = false)]
+    pub feature_bulk_delete: bool,
     #[env_config(name = "ZO_S3_ALLOW_INVALID_CERTIFICATES", default = false)]
     pub allow_invalid_certificates: bool,
     #[env_config(name = "ZO_S3_SYNC_TO_CACHE_INTERVAL", default = 600)] // seconds
@@ -1892,7 +1946,7 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
 
     if cfg.limit.file_download_thread_num == 0 {
-        cfg.limit.file_download_thread_num = cfg.limit.query_thread_num;
+        cfg.limit.file_download_thread_num = std::cmp::max(1, cpu_num / 2);
     }
 
     // HACK for move_file_thread_num equal to CPU core
@@ -2110,6 +2164,11 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     {
         cfg.common.feature_join_right_side_max_rows = 50_000;
     }
+
+    // debug check is useful only when dual write is enabled. Otherwise it will raise error
+    // incorrectly each time
+    cfg.common.file_list_dump_debug_check =
+        cfg.common.file_list_dump_dual_write && cfg.common.file_list_dump_debug_check;
 
     Ok(())
 }
@@ -2335,6 +2394,8 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     if !cfg.disk_cache.enabled {
         cfg.common.result_cache_enabled = false;
         cfg.common.metrics_cache_enabled = false;
+        cfg.cache_latest_files.enabled = false;
+        cfg.cache_latest_files.delete_merge_files = false;
     }
 
     let disks = sysinfo::disk::get_disk_usage();

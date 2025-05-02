@@ -16,14 +16,17 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Duration;
-use config::{metrics::DB_QUERY_NUMS, utils::hash::Sum64};
+use config::{
+    metrics::DB_QUERY_NUMS,
+    utils::{hash::Sum64, time::now_micros},
+};
 use sqlx::Row;
 
 use super::{TRIGGERS_KEY, Trigger, TriggerModule, TriggerStatus, get_scheduler_max_retries};
 use crate::{
     db::{
         self, IndexStatement,
-        postgres::{CLIENT, CLIENT_RO, create_index},
+        postgres::{CLIENT, CLIENT_DDL, CLIENT_RO, create_index},
     },
     errors::{DbError, Error, Result},
 };
@@ -46,9 +49,9 @@ impl Default for PostgresScheduler {
 impl super::Scheduler for PostgresScheduler {
     /// Creates the Scheduled Jobs table
     async fn create_table(&self) -> Result<()> {
-        let pool = CLIENT.clone();
+        let pool = CLIENT_DDL.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["create", "scheduled_jobs"])
+            .with_label_values(&["create", "scheduled_jobs", ""])
             .inc();
         sqlx::query(
             r#"
@@ -75,7 +78,7 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs
 
         // create start_dt column for old version <= 0.9.2
         DB_QUERY_NUMS
-            .with_label_values(&["select", "information_schema.columns"])
+            .with_label_values(&["select", "information_schema.columns", ""])
             .inc();
         let has_data_column = sqlx::query_scalar::<_,i64>("SELECT count(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name='scheduled_jobs' AND column_name='data';")
             .fetch_one(&pool)
@@ -116,7 +119,7 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs
     async fn len_module(&self, module: TriggerModule) -> usize {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["select", "scheduled_jobs"])
+            .with_label_values(&["select", "scheduled_jobs", ""])
             .inc();
         let ret = match sqlx::query(
             r#"
@@ -144,7 +147,7 @@ SELECT COUNT(*)::BIGINT AS num FROM scheduled_jobs WHERE module = $1;"#,
         let pool = CLIENT.clone();
         let mut tx = pool.begin().await?;
         DB_QUERY_NUMS
-            .with_label_values(&["insert", "scheduled_jobs"])
+            .with_label_values(&["insert", "scheduled_jobs", ""])
             .inc();
         if let Err(e) = sqlx::query(
             r#"
@@ -195,8 +198,14 @@ INSERT INTO scheduled_jobs (org, module, module_key, is_realtime, is_silenced, s
     /// Deletes the Trigger job matching the given parameters
     async fn delete(&self, org: &str, module: TriggerModule, key: &str) -> Result<()> {
         let pool = CLIENT.clone();
+        log::debug!(
+            "Deleting scheduled job for org: {}, module: {}, key: {}",
+            org,
+            module,
+            key
+        );
         DB_QUERY_NUMS
-            .with_label_values(&["delete", "scheduled_jobs"])
+            .with_label_values(&["delete", "scheduled_jobs", key])
             .inc();
         sqlx::query(
             r#"DELETE FROM scheduled_jobs WHERE org = $1 AND module_key = $2 AND module = $3;"#,
@@ -231,7 +240,7 @@ INSERT INTO scheduled_jobs (org, module, module_key, is_realtime, is_silenced, s
     ) -> Result<()> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["update", "scheduled_jobs"])
+            .with_label_values(&["update", "scheduled_jobs", key])
             .inc();
         let query = match data {
             Some(data) => {
@@ -267,7 +276,7 @@ INSERT INTO scheduled_jobs (org, module, module_key, is_realtime, is_silenced, s
     async fn update_trigger(&self, trigger: Trigger, clone: bool) -> Result<()> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["update", "scheduled_jobs"])
+            .with_label_values(&["update", "scheduled_jobs", &trigger.module_key])
             .inc();
         let query = if clone {
             sqlx::query(
@@ -319,6 +328,38 @@ INSERT INTO scheduled_jobs (org, module, module_key, is_realtime, is_silenced, s
         Ok(())
     }
 
+    /// Keeps the trigger alive
+    async fn keep_alive(&self, ids: &[i64], alert_timeout: i64, report_timeout: i64) -> Result<()> {
+        let now = now_micros();
+        let report_max_time = now
+            + Duration::try_seconds(report_timeout)
+                .unwrap()
+                .num_microseconds()
+                .unwrap();
+        let alert_max_time = now
+            + Duration::try_seconds(alert_timeout)
+                .unwrap()
+                .num_microseconds()
+                .unwrap();
+
+        let sql = format!(
+            "UPDATE scheduled_jobs SET end_time = CASE WHEN module = $1 THEN $2 ELSE $3 END WHERE id IN ({});",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let pool = CLIENT.clone();
+        sqlx::query(&sql)
+            .bind(TriggerModule::Alert)
+            .bind(alert_max_time)
+            .bind(report_max_time)
+            .execute(&pool)
+            .await?;
+
+        Ok(())
+    }
+
     /// Returns the Trigger jobs with "Waiting" status.
     /// Steps:
     /// - Read the records with status "Waiting", oldest createdAt, next_run_at <= now and limit =
@@ -335,7 +376,7 @@ INSERT INTO scheduled_jobs (org, module, module_key, is_realtime, is_silenced, s
     ) -> Result<Vec<Trigger>> {
         let pool = CLIENT.clone();
 
-        let now = chrono::Utc::now().timestamp_micros();
+        let now = now_micros();
         let report_max_time = now
             + Duration::try_seconds(report_timeout)
                 .unwrap()
@@ -358,7 +399,6 @@ WHERE id IN (
     WHERE status = $6 AND next_run_at <= $7 AND NOT (is_realtime = $8 AND is_silenced = $9) 
     ORDER BY next_run_at
     LIMIT $10
-    FOR UPDATE
 )
 RETURNING *;"#;
 
@@ -374,7 +414,7 @@ RETURNING *;"#;
         };
         let lock_sql = format!("SELECT pg_advisory_xact_lock({lock_id})");
         DB_QUERY_NUMS
-            .with_label_values(&["get_lock", "scheduled_jobs"])
+            .with_label_values(&["get_lock", "scheduled_jobs", ""])
             .inc();
         if let Err(e) = sqlx::query(&lock_sql).execute(&mut *tx).await {
             if let Err(e) = tx.rollback().await {
@@ -384,7 +424,7 @@ RETURNING *;"#;
         }
 
         DB_QUERY_NUMS
-            .with_label_values(&["update", "scheduled_jobs"])
+            .with_label_values(&["update", "scheduled_jobs", ""])
             .inc();
         let jobs: Vec<Trigger> = match sqlx::query_as::<_, Trigger>(query)
             .bind(TriggerStatus::Processing)
@@ -419,7 +459,7 @@ RETURNING *;"#;
     async fn get(&self, org: &str, module: TriggerModule, key: &str) -> Result<Trigger> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["select", "scheduled_jobs"])
+            .with_label_values(&["select", "scheduled_jobs", key])
             .inc();
         let query = r#"
 SELECT * FROM scheduled_jobs
@@ -445,7 +485,7 @@ WHERE org = $1 AND module = $2 AND module_key = $3;"#;
     async fn list(&self, module: Option<TriggerModule>) -> Result<Vec<Trigger>> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["select", "scheduled_jobs"])
+            .with_label_values(&["select", "scheduled_jobs", ""])
             .inc();
         let jobs: Vec<Trigger> = if let Some(module) = module {
             let query = r#"SELECT * FROM scheduled_jobs WHERE module = $1 ORDER BY id;"#;
@@ -464,7 +504,7 @@ WHERE org = $1 AND module = $2 AND module_key = $3;"#;
     async fn list_by_org(&self, org: &str, module: Option<TriggerModule>) -> Result<Vec<Trigger>> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["select", "scheduled_jobs"])
+            .with_label_values(&["select", "scheduled_jobs", ""])
             .inc();
         let jobs: Vec<Trigger> = if let Some(module) = module {
             let query =
@@ -488,12 +528,13 @@ WHERE org = $1 AND module = $2 AND module_key = $3;"#;
     /// retries >= threshold set through environment
     async fn clean_complete(&self) -> Result<()> {
         let pool = CLIENT.clone();
+        log::debug!("[SCHEDULER] cleaning completed jobs");
         let (include_max, mut max_retries) = get_scheduler_max_retries();
         if include_max {
             max_retries += 1;
         }
         DB_QUERY_NUMS
-            .with_label_values(&["delete", "scheduled_jobs"])
+            .with_label_values(&["delete", "scheduled_jobs", ""])
             .inc();
         // Since alert scheduled_jobs contain last_satisfied_at field, we should not delete them
         sqlx::query(
@@ -516,9 +557,9 @@ WHERE org = $1 AND module = $2 AND module_key = $3;"#;
     async fn watch_timeout(&self) -> Result<()> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["update", "scheduled_jobs"])
+            .with_label_values(&["update", "scheduled_jobs", ""])
             .inc();
-        let now = chrono::Utc::now().timestamp_micros();
+        let now = now_micros();
         let res = sqlx::query(
             r#"UPDATE scheduled_jobs
 SET status = $1, retries = retries + 1
@@ -540,7 +581,7 @@ WHERE status = $2 AND end_time <= $3;
     async fn len(&self) -> usize {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS
-            .with_label_values(&["select", "scheduled_jobs"])
+            .with_label_values(&["select", "scheduled_jobs", ""])
             .inc();
         let ret = match sqlx::query(
             r#"
@@ -567,8 +608,9 @@ SELECT COUNT(*)::BIGINT AS num FROM scheduled_jobs;"#,
 
     async fn clear(&self) -> Result<()> {
         let pool = CLIENT.clone();
+        log::debug!("[SCHEDULER] clearing scheduled_jobs table");
         DB_QUERY_NUMS
-            .with_label_values(&["delete", "scheduled_jobs"])
+            .with_label_values(&["delete", "scheduled_jobs", ""])
             .inc();
         match sqlx::query(r#"DELETE FROM scheduled_jobs;"#)
             .execute(&pool)
@@ -584,9 +626,9 @@ SELECT COUNT(*)::BIGINT AS num FROM scheduled_jobs;"#,
 
 async fn add_data_column() -> Result<()> {
     log::info!("[POSTGRES] Adding data column to scheduled_jobs table");
-    let pool = CLIENT.clone();
+    let pool = CLIENT_DDL.clone();
     DB_QUERY_NUMS
-        .with_label_values(&["alter", "scheduled_jobs"])
+        .with_label_values(&["alter", "scheduled_jobs", ""])
         .inc();
     if let Err(e) = sqlx::query(
         r#"ALTER TABLE scheduled_jobs ADD COLUMN IF NOT EXISTS data TEXT NOT NULL DEFAULT '';"#,

@@ -35,23 +35,20 @@ pub struct NodeMetrics {
     pub tcp_conns_close_wait: usize,
     pub tcp_conns_time_wait: usize,
     #[serde(default)]
-    pub open_fds: usize,
-    #[serde(default)]
-    pub tcp_conn_resets: usize,
+    pub tcp_conns_resets: usize,
 }
 
 /// Get the node running metrics
 pub fn get_node_metrics() -> NodeMetrics {
     let cpu_total = get_cpu_limit();
-    let cpu_usage = get_cpu_usage();
+    let cpu_usage = get_cpu_usage() / cpu_total as f32;
     let memory_total = get_memory_limit();
     let memory_usage = get_memory_usage();
     let tcp_conns = get_tcp_connections();
     let tcp_conns_established = net::get_tcp_connections(Some(TcpConnState::Established));
     let tcp_conns_close_wait = net::get_tcp_connections(Some(TcpConnState::CloseWait));
     let tcp_conns_time_wait = net::get_tcp_connections(Some(TcpConnState::TimeWait));
-    let open_fds = os::get_open_fds();
-    let tcp_conn_resets = net::get_tcp_conn_resets();
+    let tcp_conns_resets = net::get_tcp_conn_resets();
 
     NodeMetrics {
         cpu_total,
@@ -62,8 +59,7 @@ pub fn get_node_metrics() -> NodeMetrics {
         tcp_conns_established,
         tcp_conns_close_wait,
         tcp_conns_time_wait,
-        open_fds,
-        tcp_conn_resets,
+        tcp_conns_resets,
     }
 }
 

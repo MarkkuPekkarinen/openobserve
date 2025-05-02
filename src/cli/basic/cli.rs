@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use chrono::TimeZone;
 use config::utils::file::set_permission;
 use infra::{file_list as infra_file_list, table};
 
@@ -22,7 +23,8 @@ use crate::{
         cli::{Cli as dataCli, args as dataArgs},
         export, import,
     },
-    common::{infra::config::USERS, meta, migration},
+    common::{infra::config::USERS, meta},
+    migration,
     service::{compact, db, file_list, users},
 };
 
@@ -209,6 +211,15 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
                         .help("group size by gb, default is 5gb"),
                 ]),
             ]),
+            clap::Command::new("parse-id").about("parse snowflake id to timestamp").args([
+                clap::Arg::new("id")
+                    .short('i')
+                    .long("id")
+                    .required(true)
+                    .help("snowflake id"),
+            ]),
+            clap::Command::new("upgrade-db")
+                .about("upgrade db table schemas").args(dataArgs()),
         ])
         .get_matches();
 
@@ -252,7 +263,11 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
                             role: Some(meta::user::UserRole::Root),
                             first_name: Some("root".to_owned()),
                             last_name: Some("".to_owned()),
-                            token: None,
+                            token: if cfg.auth.root_user_token.is_empty() {
+                                None
+                            } else {
+                                Some(cfg.auth.root_user_token.clone())
+                            },
                         },
                     )
                     .await?;
@@ -448,6 +463,19 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
                     return Err(anyhow::anyhow!("unsupported sub command: {name}"));
                 }
             }
+        }
+        "parse-id" => {
+            let id = command.get_one::<String>("id").unwrap();
+            println!("id: {}", id);
+            let id = id.parse::<i64>().unwrap();
+            let ts = config::ider::to_timestamp_millis(id);
+            println!("timestamp: {}", ts);
+            let t = chrono::Utc.timestamp_nanos(ts * 1_000_000);
+            let td = t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            println!("datetimes: {}", td);
+        }
+        "upgrade-db" => {
+            crate::migration::init_db().await?;
         }
         _ => {
             return Err(anyhow::anyhow!("unsupported sub command: {name}"));

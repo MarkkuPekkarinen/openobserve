@@ -15,10 +15,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use config::{
-    BLOOM_FILTER_DEFAULT_FIELDS, RwAHashMap, RwHashMap, SQL_FULL_TEXT_SEARCH_FIELDS,
-    SQL_SECONDARY_INDEX_SEARCH_FIELDS, get_config,
+    ALL_VALUES_COL_NAME, BLOOM_FILTER_DEFAULT_FIELDS, ORIGINAL_DATA_COL_NAME, RwAHashMap,
+    RwHashMap, SQL_FULL_TEXT_SEARCH_FIELDS, SQL_SECONDARY_INDEX_SEARCH_FIELDS, get_config,
     ider::SnowflakeIdGenerator,
     meta::stream::{PartitionTimeLevel, StreamSettings, StreamType},
     utils::{json, schema_ext::SchemaExt},
@@ -45,9 +46,22 @@ pub static STREAM_SETTINGS: Lazy<RwAHashMap<String, StreamSettings>> = Lazy::new
 pub static STREAM_RECORD_ID_GENERATOR: Lazy<RwHashMap<String, SnowflakeIdGenerator>> =
     Lazy::new(Default::default);
 
+// atomic version of cache
+type StreamSettingsCache = hashbrown::HashMap<String, StreamSettings>;
+static STREAM_SETTINGS_ATOMIC: Lazy<ArcSwap<StreamSettingsCache>> =
+    Lazy::new(|| ArcSwap::from(Arc::new(hashbrown::HashMap::new())));
+
 pub async fn init() -> Result<()> {
     history::init().await?;
     Ok(())
+}
+
+pub fn get_stream_settings_atomic(key: &str) -> Option<StreamSettings> {
+    STREAM_SETTINGS_ATOMIC.load().get(key).cloned()
+}
+
+pub fn set_stream_settings_atomic(settings: StreamSettingsCache) {
+    STREAM_SETTINGS_ATOMIC.store(Arc::new(settings));
 }
 
 pub fn mk_key(org_id: &str, stream_type: StreamType, stream_name: &str) -> String {
@@ -71,8 +85,12 @@ pub async fn get_cache(
     }
 
     // Get from DB without holding any locks
-    let schema = get_from_db(org_id, stream_name, stream_type).await?;
-    let schema = SchemaCache::new(schema);
+    let db_schema = get_from_db(org_id, stream_name, stream_type).await?;
+    // if the schema is empty, return an empty schema , Don't write to cache
+    if db_schema.fields().is_empty() && db_schema.metadata().is_empty() {
+        return Ok(SchemaCache::new(db_schema));
+    }
+    let schema = SchemaCache::new(db_schema);
 
     // Only acquire write lock after DB read is complete
     let mut write_guard = STREAM_SCHEMAS_LATEST.write().await;
@@ -186,7 +204,7 @@ pub async fn get_settings(
     let key = format!("{}/{}/{}", org_id, stream_type, stream_name);
 
     // Try to get from read lock first
-    if let Some(settings) = STREAM_SETTINGS.read().await.get(&key).cloned() {
+    if let Some(settings) = get_stream_settings_atomic(&key) {
         return Some(settings);
     }
 
@@ -198,13 +216,13 @@ pub async fn get_settings(
 
     // Only acquire write lock if we have settings to update
     if let Some(ref s) = settings {
-        // Check cache again before updating as another thread might have updated while we were
-        // reading DB
-        let mut write_guard = STREAM_SETTINGS.write().await;
-        if !write_guard.contains_key(&key) {
-            write_guard.insert(key, s.clone());
+        // Check cache again before updating as another thread might updated while we reading DB
+        let mut w = STREAM_SETTINGS.write().await;
+        if !w.contains_key(&key) {
+            w.insert(key, s.clone());
         }
-        drop(write_guard);
+        set_stream_settings_atomic(w.clone());
+        drop(w);
     }
 
     settings
@@ -262,6 +280,12 @@ pub fn get_stream_setting_fts_fields(settings: &Option<StreamSettings>) -> Vec<S
         Some(settings) => {
             let mut fields = settings.full_text_search_keys.clone();
             fields.extend(default_fields);
+            if settings.index_original_data {
+                fields.push(ORIGINAL_DATA_COL_NAME.to_string());
+            }
+            if settings.index_all_values {
+                fields.push(ALL_VALUES_COL_NAME.to_string());
+            }
             fields.sort();
             fields.dedup();
             fields

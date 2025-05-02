@@ -18,7 +18,7 @@ use std::{ops::ControlFlow, sync::Arc};
 use arrow_schema::FieldRef;
 use chrono::Duration;
 use config::{
-    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, get_config,
+    ALL_VALUES_COL_NAME, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, get_config,
     meta::{
         inverted_index::InvertedIndexOptimizeMode,
         search::SearchEventType,
@@ -181,9 +181,10 @@ impl Sql {
         // 4. get match_all() value
         let mut match_visitor = MatchVisitor::new();
         statement.visit(&mut match_visitor);
+        let need_fst_fields = match_visitor.match_items.is_some();
 
         // 5. check if have full text search filed in stream
-        if stream_names.len() == 1 && match_visitor.match_items.is_some() {
+        if stream_names.len() == 1 && need_fst_fields {
             let schema = total_schemas.values().next().unwrap();
             let stream_settings = infra::schema::unwrap_stream_settings(schema.schema());
             let fts_fields = get_stream_setting_fts_fields(&stream_settings);
@@ -210,16 +211,11 @@ impl Sql {
                 query.quick_mode || cfg.limit.quick_mode_force_enabled,
                 cfg.limit.quick_mode_num_fields,
                 &search_event_type,
+                need_fst_fields,
             );
         } else {
             for (stream, schema) in total_schemas.iter() {
-                let columns = match columns.get(stream) {
-                    Some(columns) => columns.clone(),
-                    None => {
-                        used_schemas.insert(stream.clone(), schema.clone());
-                        continue;
-                    }
-                };
+                let columns = columns.get(stream).cloned().unwrap_or(Default::default());
                 let fields =
                     generate_schema_fields(columns, schema, match_visitor.match_items.is_some());
                 let schema = Schema::new(fields).with_metadata(schema.schema().metadata().clone());
@@ -261,8 +257,11 @@ impl Sql {
             && cfg.common.inverted_index_enabled
             && use_inverted_index
         {
-            let is_remove_filter = cfg.common.feature_query_remove_filter_with_index;
-            let mut index_visitor = IndexVisitor::new(&used_schemas, is_remove_filter);
+            let mut index_visitor = IndexVisitor::new(
+                &used_schemas,
+                cfg.common.feature_query_remove_filter_with_index,
+                cfg.common.inverted_index_count_optimizer_enabled,
+            );
             statement.visit(&mut index_visitor);
             index_condition = index_visitor.index_condition;
             can_optimize = index_visitor.can_optimize;
@@ -282,10 +281,7 @@ impl Sql {
         }
 
         // 13. check `select count(*) from table where match_all` optimizer
-        if can_optimize
-            && is_simple_count_query(&mut statement)
-            && cfg.common.inverted_index_count_optimizer_enabled
-        {
+        if can_optimize && is_simple_count_query(&mut statement) {
             index_optimize_mode = Some(InvertedIndexOptimizeMode::SimpleCount);
         }
 
@@ -347,6 +343,7 @@ fn generate_select_star_schema(
     quick_mode: bool,
     quick_mode_num_fields: usize,
     search_event_type: &Option<SearchEventType>,
+    need_fst_fields: bool,
 ) -> HashMap<TableReference, Arc<SchemaCache>> {
     let mut used_schemas = HashMap::new();
     for (name, schema) in schemas {
@@ -359,7 +356,8 @@ fn generate_select_star_schema(
             // don't automatically skip _original for scheduled pipeline searches
             let skip_original_column = !has_original_column
                 && !matches!(search_event_type, Some(SearchEventType::DerivedStream))
-                && schema.contains_field(ORIGINAL_DATA_COL_NAME);
+                && (schema.contains_field(ORIGINAL_DATA_COL_NAME)
+                    || schema.contains_field(ALL_VALUES_COL_NAME));
             if quick_mode || skip_original_column {
                 let fields = if quick_mode {
                     let mut columns = columns.get(&name).cloned();
@@ -376,11 +374,17 @@ fn generate_select_star_schema(
                         columns,
                         &fts_fields,
                         skip_original_column,
+                        need_fst_fields,
                     )
                 } else {
                     // skip selecting "_original" column if `SELECT * ...`
                     let mut fields = schema.schema().fields().iter().cloned().collect::<Vec<_>>();
-                    fields.retain(|field| field.name() != ORIGINAL_DATA_COL_NAME);
+                    if !need_fst_fields {
+                        fields.retain(|field| {
+                            field.name() != ORIGINAL_DATA_COL_NAME
+                                && field.name() != ALL_VALUES_COL_NAME
+                        });
+                    }
                     fields
                 };
                 let schema = Arc::new(SchemaCache::new(
@@ -430,6 +434,7 @@ fn generate_quick_mode_fields(
     columns: Option<HashSet<String>>,
     fts_fields: &[String],
     skip_original_column: bool,
+    need_fst_fields: bool,
 ) -> Vec<Arc<arrow_schema::Field>> {
     let cfg = get_config();
     let strategy = cfg.limit.quick_mode_strategy.to_lowercase();
@@ -466,7 +471,20 @@ fn generate_quick_mode_fields(
         .map(|f| f.name().to_string())
         .collect::<HashSet<_>>();
 
-    // check _timestamp
+    // check _all column
+    if cfg.common.feature_query_exclude_all {
+        if fields_name.contains(&cfg.common.column_all) {
+            fields.retain(|field| field.name().ne(&cfg.common.column_all));
+        }
+        if fields_name.contains(ORIGINAL_DATA_COL_NAME) {
+            fields.retain(|field| field.name().ne(ORIGINAL_DATA_COL_NAME));
+        }
+        if fields_name.contains(ALL_VALUES_COL_NAME) {
+            fields.retain(|field| field.name().ne(ALL_VALUES_COL_NAME));
+        }
+    }
+
+    // check _timestamp column
     if !fields_name.contains(TIMESTAMP_COL_NAME) {
         if let Ok(field) = schema.field_with_name(TIMESTAMP_COL_NAME) {
             fields.push(Arc::new(field.clone()));
@@ -485,14 +503,19 @@ fn generate_quick_mode_fields(
         }
     }
     // check fts fields
-    for field in fts_fields {
-        if !fields_name.contains(field) {
-            if let Ok(field) = schema.field_with_name(field) {
-                fields.push(Arc::new(field.clone()));
-                fields_name.insert(field.to_string());
+    if need_fst_fields {
+        for field in fts_fields {
+            if !fields_name.contains(field) {
+                if let Ok(field) = schema.field_with_name(field) {
+                    fields.push(Arc::new(field.clone()));
+                    fields_name.insert(field.to_string());
+                }
             }
         }
+    } else if fields_name.contains(ALL_VALUES_COL_NAME) {
+        fields.retain(|field| field.name() != ALL_VALUES_COL_NAME);
     }
+
     // check quick mode fields
     for field in config::QUICK_MODEL_FIELDS.iter() {
         if !fields_name.contains(field) {
@@ -502,7 +525,7 @@ fn generate_quick_mode_fields(
             }
         }
     }
-    if skip_original_column && fields_name.contains(ORIGINAL_DATA_COL_NAME) {
+    if !need_fst_fields && skip_original_column && fields_name.contains(ORIGINAL_DATA_COL_NAME) {
         fields.retain(|field| field.name() != ORIGINAL_DATA_COL_NAME);
     }
     fields
@@ -719,12 +742,17 @@ impl VisitorMut for ColumnVisitor<'_> {
 struct IndexVisitor {
     index_fields: HashSet<String>,
     is_remove_filter: bool,
+    count_optimizer_enabled: bool,
     index_condition: Option<IndexCondition>,
     pub can_optimize: bool,
 }
 
 impl IndexVisitor {
-    fn new(schemas: &HashMap<TableReference, Arc<SchemaCache>>, is_remove_filter: bool) -> Self {
+    fn new(
+        schemas: &HashMap<TableReference, Arc<SchemaCache>>,
+        is_remove_filter: bool,
+        count_optimizer_enabled: bool,
+    ) -> Self {
         let index_fields = if let Some((_, schema)) = schemas.iter().next() {
             let stream_settings = unwrap_stream_settings(schema.schema());
             let index_fields = get_stream_setting_index_fields(&stream_settings);
@@ -735,16 +763,22 @@ impl IndexVisitor {
         Self {
             index_fields,
             is_remove_filter,
+            count_optimizer_enabled,
             index_condition: None,
             can_optimize: false,
         }
     }
 
     #[allow(dead_code)]
-    fn new_from_index_fields(index_fields: HashSet<String>, is_remove_filter: bool) -> Self {
+    fn new_from_index_fields(
+        index_fields: HashSet<String>,
+        is_remove_filter: bool,
+        count_optimizer_enabled: bool,
+    ) -> Self {
         Self {
             index_fields,
             is_remove_filter,
+            count_optimizer_enabled,
             index_condition: None,
             can_optimize: false,
         }
@@ -765,10 +799,13 @@ impl VisitorMut for IndexVisitor {
                     .map(|v| v.can_remove_filter())
                     .unwrap_or(true);
                 // make sure all filter in where clause can be used in inverted index
-                if other_expr.is_none() && select.selection.is_some() && can_remove_filter {
+                if other_expr.is_none()
+                    && select.selection.is_some()
+                    && (self.count_optimizer_enabled || can_remove_filter)
+                {
                     self.can_optimize = true;
                 }
-                if self.is_remove_filter && can_remove_filter {
+                if self.is_remove_filter || can_remove_filter {
                     select.selection = other_expr;
                 }
             }
@@ -1586,6 +1623,7 @@ pub fn convert_histogram_interval_to_seconds(interval: &str) -> Result<i64, Erro
 }
 
 pub fn pickup_where(sql: &str, meta: Option<MetaSql>) -> Result<Option<String>, Error> {
+    #[allow(deprecated)]
     let meta = match meta {
         Some(v) => v,
         None => match MetaSql::new(sql) {
@@ -1623,7 +1661,8 @@ fn o2_id_is_needed(
     !matches!(search_event_type, Some(SearchEventType::DerivedStream))
         && schemas.values().any(|schema| {
             let stream_setting = unwrap_stream_settings(schema.schema());
-            stream_setting.is_some_and(|setting| setting.store_original_data)
+            stream_setting
+                .is_some_and(|setting| setting.store_original_data || setting.index_original_data)
         })
 }
 
@@ -1863,7 +1902,7 @@ mod tests {
             .unwrap();
         let mut index_fields = HashSet::new();
         index_fields.insert("name".to_string());
-        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true);
+        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true, true);
         statement.visit(&mut index_visitor);
         let expected = "name=a AND (name=b OR (_all:good AND _all:bar))";
         let expected_sql = "SELECT * FROM t WHERE age = 1 AND (match_all('foo') OR age = 2)";
@@ -1883,7 +1922,7 @@ mod tests {
             .unwrap();
         let mut index_fields = HashSet::new();
         index_fields.insert("name".to_string());
-        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true);
+        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true, true);
         statement.visit(&mut index_visitor);
         let expected = "";
         let expected_sql = "SELECT * FROM t WHERE name IS NOT NULL AND age > 1 AND (match_all('foo') OR abs(age) = 2)";
@@ -1907,7 +1946,7 @@ mod tests {
             .unwrap();
         let mut index_fields = HashSet::new();
         index_fields.insert("name".to_string());
-        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true);
+        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true, true);
         statement.visit(&mut index_visitor);
         let expected = "";
         let expected_sql = "SELECT * FROM t WHERE (name = 'b' OR (match_all('good') AND match_all('bar'))) OR (match_all('foo') OR age = 2)";
@@ -1931,7 +1970,7 @@ mod tests {
             .unwrap();
         let mut index_fields = HashSet::new();
         index_fields.insert("name".to_string());
-        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true);
+        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true, true);
         statement.visit(&mut index_visitor);
         let expected = "((name=b OR (_all:good AND _all:bar)) OR (_all:foo AND name=c))";
         let expected_sql = "SELECT * FROM t";
@@ -1951,7 +1990,7 @@ mod tests {
             .unwrap();
         let mut index_fields = HashSet::new();
         index_fields.insert("name".to_string());
-        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true);
+        let mut index_visitor = IndexVisitor::new_from_index_fields(index_fields, true, true);
         statement.visit(&mut index_visitor);
         let expected = "((_all:good AND _all:bar) OR (_all:foo AND name=c))";
         let expected_sql = "SELECT * FROM t WHERE (foo = 'b' OR foo = 'c') AND foo = 'd'";

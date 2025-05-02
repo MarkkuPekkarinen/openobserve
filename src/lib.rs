@@ -15,6 +15,7 @@
 
 #![feature(async_drop)]
 #![feature(btree_cursors)]
+#![feature(btree_extract_if)]
 
 #[cfg(feature = "enterprise")]
 pub mod cipher;
@@ -22,6 +23,7 @@ pub mod cli;
 pub mod common;
 pub mod handler;
 pub mod job;
+pub mod migration;
 pub mod router;
 pub mod service;
 

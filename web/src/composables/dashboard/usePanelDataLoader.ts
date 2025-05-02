@@ -126,7 +126,10 @@ export const usePanelDataLoader = (
   const state = reactive({
     data: [] as any,
     loading: false,
-    errorDetail: "",
+    errorDetail: {
+      message: "",
+      code: "",
+    },
     metadata: {
       queries: [] as any,
     },
@@ -136,6 +139,9 @@ export const usePanelDataLoader = (
     isCachedDataDifferWithCurrentTimeRange: false,
     searchRequestTraceIds: <string[]>[],
     isOperationCancelled: false,
+    loadingTotal: 0,
+    loadingCompleted: 0,
+    loadingProgressPercentage: 0,
   });
 
   // observer for checking if panel is visible on the screen
@@ -360,6 +366,11 @@ export const usePanelDataLoader = (
   ) => {
     const { traceparent, traceId } = generateTraceContext();
     addTraceId(traceId);
+
+    state.loadingTotal = 0;
+    state.loadingCompleted = 0;
+    state.loadingProgressPercentage = 0;
+
     try {
       // partition api call
       const res: any = await callWithAbortController(
@@ -392,6 +403,14 @@ export const usePanelDataLoader = (
 
       // partition array from api response
       const partitionArr = res?.data?.partitions ?? [];
+
+      // Set total steps: number of partitions only (excluding the initial partition API call)
+      const totalSteps = partitionArr.length;
+      state.loadingTotal = totalSteps;
+
+      // Reset loading completed and progress since we're not counting the partition API call
+      state.loadingCompleted = 0;
+      state.loadingProgressPercentage = 0;
 
       // always sort partitions in descending order
       partitionArr.sort((a: any, b: any) => a[0] - b[0]);
@@ -449,8 +468,19 @@ export const usePanelDataLoader = (
               ),
             abortControllerRef.signal,
           );
+
+          // Update the progress after each partition completes
+          state.loadingCompleted = state.loadingCompleted + 1;
+          // Calculate progress in 0-100 format
+          state.loadingProgressPercentage = Math.round(
+            (state.loadingCompleted / totalSteps) * 100,
+          );
+
           // remove past error detail
-          state.errorDetail = "";
+          state.errorDetail = {
+            message: "",
+            code: "",
+          };
 
           // Removing below part to allow rendering chart if the error is a function error
           // if there is an function error and which not related to stream range, throw error
@@ -565,7 +595,10 @@ export const usePanelDataLoader = (
 
   const handleHistogramResponse = async (payload: any, searchRes: any) => {
     // remove past error detail
-    state.errorDetail = "";
+    state.errorDetail = {
+      message: "",
+      code: "",
+    };
 
     // is streaming aggs
     const streaming_aggs = searchRes?.content?.streaming_aggs ?? false;
@@ -605,6 +638,9 @@ export const usePanelDataLoader = (
       if (response.type === "error") {
         // set loading to false
         state.loading = false;
+        state.loadingTotal = 0;
+        state.loadingCompleted = 0;
+        state.loadingProgressPercentage = 0;
         state.isOperationCancelled = false;
 
         processApiError(response?.content, "sql");
@@ -613,13 +649,26 @@ export const usePanelDataLoader = (
       if (response.type === "end") {
         // set loading to false
         state.loading = false;
+        state.loadingTotal = 0;
+        state.loadingCompleted = 0;
+        state.loadingProgressPercentage = 0;
         state.isOperationCancelled = false;
+      }
+      if (response.type === "event_progress") {
+        // The loadingProgressPercentage value is now in 0-100 format, no need to multiply
+        state.loadingProgressPercentage = response?.content?.percent ?? 0;
       }
     } catch (error: any) {
       // set loading to false
       state.loading = false;
       state.isOperationCancelled = false;
-      state.errorDetail = error?.message || "Unknown error in search response";
+      state.loadingTotal = 0;
+      state.loadingCompleted = 0;
+      state.loadingProgressPercentage = 0;
+      state.errorDetail = {
+        message: error?.message || "Unknown error in search response",
+        code: error?.code ?? "",
+      };
     }
   };
 
@@ -665,7 +714,6 @@ export const usePanelDataLoader = (
       processApiError(response?.content, "sql");
     }
 
-
     const errorCodes = [1001, 1006, 1010, 1011, 1012, 1013];
 
     if (errorCodes.includes(response.code)) {
@@ -676,7 +724,7 @@ export const usePanelDataLoader = (
           trace_id: payload.traceId,
           code: response.code,
           error_detail: "",
-        }
+        },
       });
     }
 
@@ -688,26 +736,18 @@ export const usePanelDataLoader = (
     saveCurrentStateToCache();
   };
 
-  const handleSearchReset = (payload: any) => {
-    // reset old state data
-    state.data = [];
-    state.resultMetaData = [];
-
-    getDataThroughWebSocket(
-      payload.queryReq.query,
-      payload.queryReq.it,
-      payload.queryReq.startISOTimestamp,
-      payload.queryReq.endISOTimestamp,
-      payload.pageType,
-      payload.currentQueryIndex,
-    );
-  }
+  const handleSearchReset = (payload: any, traceId?: string) => {
+    loadData();
+  };
 
   const handleSearchError = (payload: any, response: any) => {
     removeTraceId(payload.traceId);
 
     // set loading to false
     state.loading = false;
+    state.loadingTotal = 0;
+    state.loadingCompleted = 0;
+    state.loadingProgressPercentage = 0;
     state.isOperationCancelled = false;
 
     processApiError(response?.content, "sql");
@@ -757,7 +797,10 @@ export const usePanelDataLoader = (
 
       addTraceId(traceId);
     } catch (e: any) {
-      state.errorDetail = e?.message || e;
+      state.errorDetail = {
+        message: e?.message || e,
+        code: e?.code ?? "",
+      };
       state.loading = false;
       state.isOperationCancelled = false;
     }
@@ -766,7 +809,9 @@ export const usePanelDataLoader = (
   const loadData = async () => {
     try {
       log("loadData: entering...");
-
+      state.loadingTotal = 0;
+      state.loadingCompleted = 0;
+      state.loadingProgressPercentage = 0;
       // Check and abort the previous call if necessary
       if (abortController) {
         log("loadData: aborting previous function call (if any)");
@@ -849,8 +894,11 @@ export const usePanelDataLoader = (
       state.isCachedDataDifferWithCurrentTimeRange = false;
 
       // remove past error detail
-      state.errorDetail = "";
-      
+      state.errorDetail = {
+        message: "",
+        code: "",
+      };
+
       // Check if the query type is "promql"
       if (panelSchema.value.queryType == "promql") {
         // Iterate through each query in the panel schema
@@ -890,7 +938,10 @@ export const usePanelDataLoader = (
                 abortController.signal,
               );
 
-              state.errorDetail = "";
+              state.errorDetail = {
+                message: "",
+                code: "",
+              };
               return { result: res.data.data, metadata: metadata };
             } catch (error) {
               processApiError(error, "promql");
@@ -923,7 +974,6 @@ export const usePanelDataLoader = (
         const abortControllerRef = abortController;
 
         try {
-
           // Call search API
           state.data = [];
           state.metadata = {
@@ -932,7 +982,7 @@ export const usePanelDataLoader = (
           state.resultMetaData = [];
           state.annotations = [];
           state.isOperationCancelled = false;
-          
+
           // Get the page type from the first query in the panel schema
           const pageType = panelSchema.value.queries[0]?.fields?.stream_type;
 
@@ -1059,7 +1109,10 @@ export const usePanelDataLoader = (
                     abortControllerRef.signal,
                   );
                   // remove past error detail
-                  state.errorDetail = "";
+                  state.errorDetail = {
+                    message: "",
+                    code: "",
+                  };
 
                   // if there is an function error and which not related to stream range, throw error
                   if (
@@ -1440,7 +1493,13 @@ export const usePanelDataLoader = (
           errorDetailValue?.length > 300
             ? errorDetailValue.slice(0, 300) + " ..."
             : errorDetailValue;
-        state.errorDetail = trimmedErrorMessage;
+
+        const errorCode = error?.response?.data?.code || error?.code || "";
+
+        state.errorDetail = {
+          message: trimmedErrorMessage,
+          code: errorCode,
+        };
         break;
       }
       case "sql": {
@@ -1455,7 +1514,13 @@ export const usePanelDataLoader = (
           errorDetailValue?.length > 300
             ? errorDetailValue.slice(0, 300) + " ..."
             : errorDetailValue;
-        state.errorDetail = trimmedErrorMessage;
+
+        const errorCode = error?.response?.data?.code || error?.code || "";
+
+        state.errorDetail = {
+          message: trimmedErrorMessage,
+          code: errorCode,
+        };
         break;
       }
       default:

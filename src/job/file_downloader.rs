@@ -16,14 +16,14 @@
 use std::sync::Arc;
 
 use config::get_config;
-use infra::cache::file_data::{self, CacheType};
+use infra::cache::file_data;
 use once_cell::sync::Lazy;
 use tokio::sync::{
     Mutex,
     mpsc::{Receiver, Sender},
 };
 
-type FileInfo = (String, String, CacheType);
+type FileInfo = (String, usize, file_data::CacheType);
 
 struct DownloadQueue {
     sender: Sender<FileInfo>,
@@ -38,9 +38,7 @@ impl DownloadQueue {
 
 const FILE_DOWNLOAD_QUEUE_SIZE: usize = 10000;
 static FILE_DOWNLOAD_CHANNEL: Lazy<DownloadQueue> = Lazy::new(|| {
-    let (tx, rx) =
-        tokio::sync::mpsc::channel::<(String, String, CacheType)>(FILE_DOWNLOAD_QUEUE_SIZE);
-
+    let (tx, rx) = tokio::sync::mpsc::channel::<FileInfo>(FILE_DOWNLOAD_QUEUE_SIZE);
     DownloadQueue::new(tx, Arc::new(Mutex::new(rx)))
 });
 
@@ -57,14 +55,39 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         log::debug!("[FILE_CACHE_DOWNLOAD:JOB] Receiving channel is closed");
                         break;
                     }
-                    Some((trace_id, file, cache)) => {
-                        if let Err(e) = download_file(&trace_id, &file, cache).await {
-                            log::error!(
-                                "[trace_id {trace_id}] search->storage: download file {} to cache {:?} err: {}",
-                                file,
-                                cache,
-                                e,
-                            );
+                    Some((file, file_size, cache)) => {
+                        match download_file(&file, file_size, cache).await {
+                            Ok(data_len) => {
+                                if data_len > 0 && data_len != file_size {
+                                    log::warn!(
+                                        "[FileDownloader] download file {} found size mismatch, expected: {}, actual: {}, will update it",
+                                        file,
+                                        file_size,
+                                        data_len,
+                                    );
+                                    // update database
+                                    if let Err(e) = infra::file_list::update_compressed_size(
+                                        &file,
+                                        data_len as i64,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "[FileDownloader] update file size for file {} err: {}",
+                                            file,
+                                            e,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "[FileDownloader] download file {} to cache {:?} err: {}",
+                                    file,
+                                    cache,
+                                    e,
+                                );
+                            }
                         }
                     }
                 }
@@ -76,54 +99,43 @@ pub async fn run() -> Result<(), anyhow::Error> {
 }
 
 async fn download_file(
-    trace_id: &str,
     file_name: &str,
-    cache_type: CacheType,
-) -> Result<(), anyhow::Error> {
+    file_size: usize,
+    cache_type: file_data::CacheType,
+) -> Result<usize, anyhow::Error> {
     let cfg = get_config();
-    let ret = match cache_type {
+    match cache_type {
         file_data::CacheType::Memory => {
             let mut disk_exists = false;
             let mem_exists = file_data::memory::exist(file_name).await;
             if !mem_exists && !cfg.memory_cache.skip_disk_check {
-                // when skip_disk_check = false, need to check disk cache
                 disk_exists = file_data::disk::exist(file_name).await;
             }
             if !mem_exists && (cfg.memory_cache.skip_disk_check || !disk_exists) {
-                file_data::memory::download(trace_id, file_name).await.err()
+                file_data::memory::download(file_name, Some(file_size)).await
             } else {
-                None
+                Ok(0)
             }
         }
         file_data::CacheType::Disk => {
             if !file_data::disk::exist(file_name).await {
-                file_data::disk::download(trace_id, file_name).await.err()
+                file_data::disk::download(file_name, Some(file_size)).await
             } else {
-                None
+                Ok(0)
             }
         }
-        _ => None,
-    };
-    match ret {
-        Some(e) => Err(e),
-        None => {
-            log::debug!(
-                "[trace_id {trace_id}] successfully downloaded file {file_name} into cache {:?}",
-                cache_type
-            );
-            Ok(())
-        }
+        _ => Ok(0),
     }
 }
 
-pub async fn queue_background_download(
-    trace_id: &str,
+pub async fn queue_download(
     file: &str,
-    cache_type: CacheType,
+    size: i64,
+    cache_type: file_data::CacheType,
 ) -> Result<(), anyhow::Error> {
     FILE_DOWNLOAD_CHANNEL
         .sender
-        .send((trace_id.to_owned(), file.to_owned(), cache_type))
+        .send((file.to_owned(), size as usize, cache_type))
         .await?;
     Ok(())
 }

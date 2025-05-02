@@ -29,7 +29,7 @@ use config::{
         stream::{FileKey, QueryPartitionStrategy, StreamType},
     },
     metrics,
-    utils::{inverted_index::split_token, json, time::BASE_TIME},
+    utils::{inverted_index::split_token, json, time::now_micros},
 };
 use datafusion::{
     common::{TableReference, tree_node::TreeNode},
@@ -50,22 +50,26 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::{
     common::infra::cluster as infra_cluster,
-    service::search::{
-        DATAFUSION_RUNTIME,
-        datafusion::{
-            distributed_plan::{
-                EmptyExecVisitor,
-                remote_scan::RemoteScanExec,
-                rewrite::{RemoteScanRewriter, StreamingAggsRewriter},
+    service::{
+        db::enrichment_table,
+        search::{
+            DATAFUSION_RUNTIME, SearchResult,
+            datafusion::{
+                distributed_plan::{
+                    EmptyExecVisitor,
+                    remote_scan::RemoteScanExec,
+                    rewrite::{RemoteScanRewriter, StreamingAggsRewriter},
+                },
+                exec::{prepare_datafusion_context, register_udf},
+                optimizer::{generate_analyzer_rules, generate_optimizer_rules},
+                table_provider::{catalog::StreamTypeProvider, empty_table::NewEmptyTable},
             },
-            exec::{prepare_datafusion_context, register_udf},
-            optimizer::generate_optimizer_rules,
-            table_provider::{catalog::StreamTypeProvider, empty_table::NewEmptyTable},
+            generate_filter_from_equal_items,
+            inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
+            request::Request,
+            sql::Sql,
+            utils::{AsyncDefer, ScanStatsVisitor},
         },
-        generate_filter_from_equal_items,
-        request::Request,
-        sql::Sql,
-        utils::{AsyncDefer, ScanStatsVisitor},
     },
 };
 
@@ -80,7 +84,7 @@ pub async fn search(
     sql: Arc<Sql>,
     mut req: Request,
     query: SearchQuery,
-) -> Result<(Vec<RecordBatch>, ScanStats, usize, bool, usize, String)> {
+) -> Result<SearchResult> {
     let start = std::time::Instant::now();
     let cfg = get_config();
     log::info!("[trace_id {trace_id}] flight->search: start {}", sql);
@@ -97,11 +101,12 @@ pub async fn search(
         .iter()
         .any(|(_, schema)| schema.schema().fields().is_empty())
     {
-        return Ok((vec![], ScanStats::new(), 0, false, 0, "".to_string()));
+        return Ok((vec![], ScanStats::new(), 0, false, "".to_string()));
     }
 
     // 1. get file id list
     let file_id_list = get_file_id_lists(
+        trace_id,
         &sql.org_id,
         sql.stream_type,
         &sql.stream_names,
@@ -111,10 +116,22 @@ pub async fn search(
     let file_id_list_vec = file_id_list.values().flatten().collect::<Vec<_>>();
     let file_id_list_took = start.elapsed().as_millis() as usize;
     log::info!(
-        "[trace_id {trace_id}] flight->search: get file_list time_range: {:?}, files: {}, took: {} ms",
-        sql.time_range,
-        file_id_list_vec.len(),
-        file_id_list_took,
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {trace_id}] flight->search: get file_list time_range: {:?}, files: {}, took: {} ms",
+                sql.time_range,
+                file_id_list_vec.len(),
+                file_id_list_took,
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("flight:leader get file id".to_string())
+                .search_role("leader".to_string())
+                .duration(file_id_list_took)
+                .desc(format!("get files {} ids", file_id_list_vec.len(),))
+                .build()
+        )
     );
     let mut scan_stats = ScanStats {
         files: file_id_list_vec.len() as i64,
@@ -127,9 +144,15 @@ pub async fn search(
         get_inverted_index_file_lists(trace_id, &req, &sql, &query).await?;
     scan_stats.idx_scan_size = idx_scan_size as i64;
     req.set_use_inverted_index(use_ttv_inverted_index);
+    log::info!(
+        "[trace_id {trace_id}] flight->search: get get_inverted_index_file_lists idx_scan_size: {:?}, idx_took: {} ms",
+        idx_scan_size,
+        idx_took,
+    );
 
     // 3. get nodes
-    let node_group = req
+    let get_node_start = std::time::Instant::now();
+    let role_group = req
         .search_event_type
         .as_ref()
         .map(|v| {
@@ -138,11 +161,11 @@ pub async fn search(
                 .map(RoleGroup::from)
         })
         .unwrap_or(None);
-    let mut nodes = get_online_querier_nodes(trace_id, node_group).await?;
+    let mut nodes = get_online_querier_nodes(trace_id, role_group).await?;
 
-    // local mode, only use local node as querier for the query
+    // local mode, only use local node as querier node
     if req.local_mode.unwrap_or_default() && LOCAL_NODE.is_querier() {
-        nodes = vec![LOCAL_NODE.clone()];
+        nodes.retain(|n| n.is_ingester() || n.name.eq(&LOCAL_NODE.name));
     }
 
     let querier_num = nodes.iter().filter(|node| node.is_querier()).count();
@@ -152,9 +175,25 @@ pub async fn search(
     }
 
     log::info!(
-        "[trace_id {trace_id}] flight->search: get nodes num: {}, querier num: {}",
-        nodes.len(),
-        querier_num,
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {trace_id}] flight->search: get nodes num: {}, querier num: {}",
+                nodes.len(),
+                querier_num,
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("flight:leader get nodes".to_string())
+                .search_role("leader".to_string())
+                .duration(get_node_start.elapsed().as_millis() as usize)
+                .desc(format!(
+                    "get nodes num: {}, querier num: {}",
+                    nodes.len(),
+                    querier_num
+                ))
+                .build()
+        )
     );
 
     // waiting in work group queue
@@ -175,6 +214,7 @@ pub async fn search(
         &file_id_list_vec,
         start,
         file_list_took,
+        "leader".to_string(),
     )
     .await?;
     // add work_group
@@ -227,7 +267,7 @@ pub async fn search(
     });
 
     // 5. partition file list
-    let partitioned_file_lists = partition_file_lists(file_id_list, &nodes, node_group).await?;
+    let partitioned_file_lists = partition_file_lists(file_id_list, &nodes, role_group).await?;
 
     #[cfg(feature = "enterprise")]
     super::super::SEARCH_SERVER
@@ -333,12 +373,13 @@ pub async fn search(
     log::info!("[trace_id {trace_id}] flight->search: search finished");
 
     scan_stats.format_to_mb();
+    scan_stats.idx_took += idx_took as i64;
+    scan_stats.file_list_took += file_id_list_took as i64;
     Ok((
         data,
         scan_stats,
         took_wait,
         !partial_err.is_empty(),
-        idx_took,
         partial_err,
     ))
 }
@@ -450,6 +491,7 @@ pub async fn run_datafusion(
     }
 
     // run datafusion
+    let datafusion_start = std::time::Instant::now();
     let ret = datafusion::physical_plan::collect(physical_plan.clone(), ctx.task_ctx()).await;
     let mut visit = ScanStatsVisitor::new();
     let _ = visit_execution_plan(physical_plan.as_ref(), &mut visit);
@@ -457,7 +499,18 @@ pub async fn run_datafusion(
         log::error!("[trace_id {trace_id}] flight->search: datafusion collect error: {e}");
         Err(e.into())
     } else {
-        log::info!("[trace_id {trace_id}] flight->search: datafusion collect done");
+        log::info!(
+            "{}",
+            search_inspector_fields(
+                format!("[trace_id {trace_id}] flight->search: datafusion collect done"),
+                SearchInspectorFieldsBuilder::new()
+                    .node_name(LOCAL_NODE.name.clone())
+                    .component("flight:run_datafusion collect done".to_string())
+                    .search_role("follower".to_string())
+                    .duration(datafusion_start.elapsed().as_millis() as usize)
+                    .build()
+            )
+        );
         ret.map(|data| (data, visit.scan_stats, visit.partial_err))
             .map_err(|e| e.into())
     }
@@ -465,14 +518,14 @@ pub async fn run_datafusion(
 
 pub async fn get_online_querier_nodes(
     trace_id: &str,
-    node_group: Option<RoleGroup>,
+    role_group: Option<RoleGroup>,
 ) -> Result<Vec<Node>> {
     // get nodes from cluster
     let cfg = get_config();
     let nodes = if cfg.common.feature_query_skip_wal {
-        infra_cluster::get_cached_online_querier_nodes(node_group).await
+        infra_cluster::get_cached_online_querier_nodes(role_group).await
     } else {
-        infra_cluster::get_cached_online_query_nodes(node_group).await
+        infra_cluster::get_cached_online_query_nodes(role_group).await
     };
     let mut nodes = match nodes {
         Some(nodes) => nodes,
@@ -538,6 +591,7 @@ pub async fn check_work_group(
     file_id_list_vec: &[&FileId],
     start: std::time::Instant,
     file_list_took: usize, // the time took to get file list
+    search_role: String,
 ) -> Result<(
     usize,
     String,
@@ -612,8 +666,19 @@ pub async fn check_work_group(
     // done in the queue
     let took_wait = start.elapsed().as_millis() as usize - file_list_took;
     log::info!(
-        "[trace_id {trace_id}] search: wait in queue took: {} ms",
-        took_wait,
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {trace_id}] search: wait in queue took: {} ms",
+                took_wait
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("flight:check_work_group".to_string())
+                .search_role(search_role)
+                .duration(took_wait)
+                .build()
+        )
     );
     Ok((took_wait, work_group_str, work_group))
 }
@@ -641,7 +706,7 @@ pub async fn partition_filt_list(
     let querier_num = nodes.iter().filter(|node| node.is_querier()).count();
     let mut partition_strategy =
         QueryPartitionStrategy::from(&cfg.common.feature_query_partition_strategy);
-    if cfg.memory_cache.cache_latest_files {
+    if cfg.cache_latest_files.enabled {
         partition_strategy = QueryPartitionStrategy::FileHash;
     }
     let partitions = match partition_strategy {
@@ -756,9 +821,11 @@ pub async fn generate_context(
     sql: &Arc<Sql>,
     target_partitions: usize,
 ) -> Result<SessionContext> {
+    let analyzer_rules = generate_analyzer_rules(sql);
     let optimizer_rules = generate_optimizer_rules(sql);
     let mut ctx = prepare_datafusion_context(
         req.work_group.clone(),
+        analyzer_rules,
         optimizer_rules,
         sql.sorted_by_time,
         target_partitions,
@@ -806,6 +873,7 @@ pub async fn register_table(ctx: &SessionContext, sql: &Sql) -> Result<()> {
 
 #[tracing::instrument(name = "service:search:cluster:flight:get_file_id_lists", skip_all)]
 pub async fn get_file_id_lists(
+    trace_id: &str,
     org_id: &str,
     stream_type: StreamType,
     stream_names: &[TableReference],
@@ -819,14 +887,15 @@ pub async fn get_file_id_lists(
         // if stream is enrich, rewrite the time_range
         if let Some(schema) = stream.schema() {
             if schema == "enrich" || schema == "enrichment_tables" {
-                let start = BASE_TIME.timestamp_micros();
-                let end = chrono::Utc::now().timestamp_micros();
+                let start = enrichment_table::get_start_time(org_id, &name).await;
+                let end = now_micros();
                 time_range = Some((start, end));
             }
         }
         // get file list
         let file_id_list =
-            crate::service::file_list::query_ids(org_id, stream_type, &name, time_range).await?;
+            crate::service::file_list::query_ids(trace_id, org_id, stream_type, &name, time_range)
+                .await?;
         file_lists.insert(stream.clone(), file_id_list);
     }
     Ok(file_lists)

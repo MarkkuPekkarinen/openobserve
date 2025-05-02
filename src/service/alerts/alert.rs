@@ -279,10 +279,16 @@ async fn prepare_alert(
         alert.trigger_condition.cron = update_cron_expression(&alert.trigger_condition.cron, now);
         // Check the cron expression
         Schedule::from_str(&alert.trigger_condition.cron).map_err(AlertError::ParseCron)?;
-    } else if alert.trigger_condition.frequency == 0 {
-        // default frequency is 60 seconds
-        alert.trigger_condition.frequency =
-            std::cmp::max(60, get_config().limit.alert_schedule_interval);
+    } else {
+        // if cron is not empty, set it to empty string
+        if !alert.trigger_condition.cron.is_empty() {
+            alert.trigger_condition.cron = "".to_string();
+        }
+        if alert.trigger_condition.frequency == 0 {
+            // default frequency is 60 seconds
+            alert.trigger_condition.frequency =
+                std::cmp::max(60, get_config().limit.alert_schedule_interval);
+        }
     }
 
     if alert.name.is_empty() || alert.stream_name.is_empty() {
@@ -826,6 +832,7 @@ pub trait AlertExt: Sync + Send + 'static {
         &self,
         row: Option<&Map<String, Value>>,
         (start_time, end_time): (Option<i64>, i64),
+        trace_id: Option<String>,
     ) -> Result<TriggerEvalResults, anyhow::Error>;
 
     /// Returns a tuple containing a boolean - if all the send notification jobs successfully
@@ -845,6 +852,7 @@ impl AlertExt for Alert {
         &self,
         row: Option<&Map<String, Value>>,
         (start_time, end_time): (Option<i64>, i64),
+        trace_id: Option<String>,
     ) -> Result<TriggerEvalResults, anyhow::Error> {
         if self.is_real_time {
             self.query_condition.evaluate_realtime(row).await
@@ -862,6 +870,7 @@ impl AlertExt for Alert {
                     (start_time, end_time),
                     Some(SearchEventType::Alerts),
                     Some(search_event_ctx),
+                    trace_id,
                 )
                 .await
         }
@@ -1610,10 +1619,25 @@ pub fn get_alert_start_end_time(
     }
     (alert_start_time, alert_end_time)
 }
-
 fn format_variable_value(val: String) -> String {
     val.chars()
-        .flat_map(|c| c.escape_default())
+        .map(|c| match c {
+            '\'' => "\\\\'".to_string(),
+            '"' => "\\\"".to_string(),
+            '\\' => "\\\\".to_string(),
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            '\0' => "\\u{0}".to_string(),
+            '\x1b' => "\\u{1b}".to_string(),
+            '\x08' => "\\u{8}".to_string(),
+            '\x0c' => "\\u{c}".to_string(),
+            '\x0b' => "\\u{b}".to_string(),
+            '\x01' => "\\u{1}".to_string(),
+            '\x02' => "\\u{2}".to_string(),
+            '\x1f' => "\\u{1f}".to_string(),
+            _ => c.to_string(),
+        })
         .collect::<String>()
 }
 
@@ -1784,6 +1808,12 @@ mod tests {
         assert_eq!(
             format_variable_value("Hello World".to_string()),
             "Hello World"
+        );
+
+        // Test emoji
+        assert_eq!(
+            format_variable_value("你好世界セメント한국어atīna👍".to_string()),
+            "你好世界セメント한국어atīna👍"
         );
     }
 

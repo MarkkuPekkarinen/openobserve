@@ -18,6 +18,7 @@ use std::sync::Arc;
 use ::datafusion::arrow::record_batch::RecordBatch;
 use config::{
     meta::{function::VRLResultResolver, search, sql::TableReferenceExt},
+    metrics::QUERY_PARQUET_CACHE_RATIO,
     utils::{
         arrow::record_batches_to_json_rows,
         flatten,
@@ -52,6 +53,17 @@ pub async fn search(
     // handle request time range
     let meta = Sql::new_from_req(&req, &query).await?;
     let sql = Arc::new(meta);
+
+    for s in sql.stream_names.iter() {
+        let schema =
+            infra::schema::get_cache(&sql.org_id, &s.stream_name(), sql.stream_type).await?;
+        if schema.schema().fields().is_empty() {
+            let mut result = search::Response::new(sql.offset, sql.limit);
+            result.function_error = vec![format!("Stream not found {}", &s.stream_name())];
+            result.is_partial = true;
+            return Ok(result);
+        }
+    }
 
     // set this value to null & use it later on results ,
     // this being to avoid performance impact of query fn being applied during query
@@ -89,7 +101,7 @@ pub async fn search(
     #[cfg(not(feature = "enterprise"))]
     let ret = flight::search(&trace_id, sql.clone(), req, query).await;
 
-    let (merge_batches, scan_stats, took_wait, is_partial, idx_took, partial_err) = match ret {
+    let (merge_batches, scan_stats, took_wait, is_partial, partial_err) = match ret {
         Ok(v) => v,
         Err(e) => {
             log::error!("[trace_id {trace_id}] http->search: err: {:?}", e);
@@ -253,25 +265,32 @@ pub async fn search(
             .unwrap_or_default()
     };
 
+    let took_time = start.elapsed().as_millis() as usize;
+
     result.set_total(total);
     result.set_histogram_interval(sql.histogram_interval);
     result.set_partial(is_partial, partial_err);
-    result.set_cluster_took(start.elapsed().as_millis() as usize, took_wait);
+    result.set_took(took_time);
+    result.set_wait_in_queue(took_wait);
+    result.set_search_took(
+        took_time - took_wait,
+        scan_stats.file_list_took as usize,
+        scan_stats.idx_took as usize,
+    );
     result.set_file_count(scan_stats.files as usize);
     result.set_scan_size(scan_stats.original_size as usize);
     result.set_scan_records(scan_stats.records as usize);
-    result.set_cached_ratio(
-        (((scan_stats.querier_memory_cached_files + scan_stats.querier_disk_cached_files) * 100)
-            as f64
-            / scan_stats.querier_files as f64) as usize,
-    );
     result.set_idx_scan_size(scan_stats.idx_scan_size as usize);
 
-    result.set_idx_took(if idx_took > 0 {
-        idx_took
-    } else {
-        scan_stats.idx_took as usize
-    });
+    if scan_stats.querier_files > 0 {
+        let cached_ratio = (scan_stats.querier_memory_cached_files
+            + scan_stats.querier_disk_cached_files) as f64
+            / scan_stats.querier_files as f64;
+        result.set_cached_ratio((cached_ratio * 100.0) as usize);
+        QUERY_PARQUET_CACHE_RATIO
+            .with_label_values(&[&sql.org_id, &sql.stream_type.to_string()])
+            .observe(cached_ratio);
+    }
 
     if query_type == "table" {
         result.response_type = "table".to_string();

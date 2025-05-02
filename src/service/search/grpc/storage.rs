@@ -18,8 +18,9 @@ use std::{collections::HashSet, sync::Arc};
 use anyhow::Context;
 use arrow_schema::Schema;
 use config::{
-    FILE_EXT_TANTIVY, FILE_EXT_TANTIVY_FOLDER, INDEX_FIELD_NAME_FOR_ALL, get_config,
-    is_local_disk_storage,
+    FILE_EXT_TANTIVY, FILE_EXT_TANTIVY_FOLDER, INDEX_FIELD_NAME_FOR_ALL,
+    cluster::LOCAL_NODE,
+    get_config, is_local_disk_storage,
     meta::{
         bitvec::BitVec,
         inverted_index::{InvertedIndexOptimizeMode, InvertedIndexTantivyMode},
@@ -29,6 +30,7 @@ use config::{
     utils::{
         file::is_exists,
         inverted_index::convert_parquet_idx_file_name_to_tantivy_file,
+        size::bytes_to_human_readable,
         tantivy::tokenizer::{O2_TOKENIZER, o2_tokenizer_build},
         time::BASE_TIME,
     },
@@ -53,6 +55,7 @@ use crate::{
             datafusion::exec,
             generate_search_schema_diff,
             index::IndexCondition,
+            inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
             tantivy::puffin_directory::{
                 caching_directory::CachingDirectory,
                 convert_puffin_file_to_tantivy_dir,
@@ -115,6 +118,7 @@ pub async fn search(
     if files.is_empty() {
         return Ok((vec![], ScanStats::default()));
     }
+    let original_files_len = files.len();
     log::info!(
         "[trace_id {}] search->storage: stream {}/{}/{}, load file_list num {}",
         query.trace_id,
@@ -147,15 +151,33 @@ pub async fn search(
             idx_optimize_rule,
         )
         .await?;
+
         log::info!(
-            "[trace_id {}] search->storage: stream {}/{}/{}, {} inverted index reduced file_list num to {} in {} ms",
-            query.trace_id,
-            query.org_id,
-            query.stream_type,
-            query.stream_name,
-            inverted_index_type,
-            files.len(),
-            idx_took
+            "{}",
+            search_inspector_fields(
+                format!(
+                    "[trace_id {}] search->storage: stream {}/{}/{}, {} inverted index reduced file_list num to {} in {} ms",
+                    query.trace_id,
+                    query.org_id,
+                    query.stream_type,
+                    query.stream_name,
+                    inverted_index_type,
+                    files.len(),
+                    idx_took
+                ),
+                SearchInspectorFieldsBuilder::new()
+                    .node_name(LOCAL_NODE.name.clone())
+                    .component("storage inverted index reduced file_list num".to_string())
+                    .search_role("follower".to_string())
+                    .duration(idx_took)
+                    .desc(format!(
+                        "inverted index reduced file_list from {} to {} in {} ms",
+                        original_files_len,
+                        files.len(),
+                        idx_took
+                    ))
+                    .build()
+            )
         );
     }
 
@@ -235,7 +257,10 @@ pub async fn search(
     let cache_start = std::time::Instant::now();
     let cache_type = cache_files(
         &query.trace_id,
-        &files.iter().map(|f| f.key.as_ref()).collect_vec(),
+        &files
+            .iter()
+            .map(|f| (f.key.as_ref(), f.meta.compressed_size))
+            .collect_vec(),
         &mut scan_stats,
         "parquet",
     )
@@ -249,16 +274,36 @@ pub async fn search(
     } else {
         format!("downloading others into {:?} in background,", cache_type)
     };
+
     log::info!(
-        "[trace_id {}] search->storage: stream {}/{}/{}, load files {}, memory cached {}, disk cached {}, {download_msg} took: {} ms",
-        query.trace_id,
-        query.org_id,
-        query.stream_type,
-        query.stream_name,
-        scan_stats.querier_files,
-        scan_stats.querier_memory_cached_files,
-        scan_stats.querier_disk_cached_files,
-        cache_start.elapsed().as_millis()
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {}] search->storage: stream {}/{}/{}, load files {}, memory cached {}, disk cached {}, {download_msg} took: {} ms",
+                query.trace_id,
+                query.org_id,
+                query.stream_type,
+                query.stream_name,
+                scan_stats.querier_files,
+                scan_stats.querier_memory_cached_files,
+                scan_stats.querier_disk_cached_files,
+                cache_start.elapsed().as_millis()
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("storage load files".to_string())
+                .search_role("follower".to_string())
+                .duration(cache_start.elapsed().as_millis() as usize)
+                .desc(format!(
+                    "load files {}, memory cached {}, disk cached {}, scan_size {}, compressed_size {}",
+                    scan_stats.querier_files,
+                    scan_stats.querier_memory_cached_files,
+                    scan_stats.querier_disk_cached_files,
+                    bytes_to_human_readable(scan_stats.original_size as f64),
+                    bytes_to_human_readable(scan_stats.compressed_size as f64)
+                ))
+                .build()
+        )
     );
 
     // set target partitions based on cache type
@@ -281,6 +326,7 @@ pub async fn search(
     }
 
     let mut tables = Vec::new();
+    let start = std::time::Instant::now();
     for (ver, files) in files_group {
         if files.is_empty() {
             continue;
@@ -319,19 +365,36 @@ pub async fn search(
         tables.push(table);
     }
 
+    log::info!(
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {}] search->storage: create tables took: {} ms",
+                query.trace_id,
+                start.elapsed().as_millis()
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("storage create tables".to_string())
+                .search_role("follower".to_string())
+                .duration(start.elapsed().as_millis() as usize)
+                .build()
+        )
+    );
+
     Ok((tables, scan_stats))
 }
 
 #[tracing::instrument(name = "service:search:grpc:storage:cache_files", skip_all)]
-async fn cache_files(
+pub async fn cache_files(
     trace_id: &str,
-    files: &[&str],
+    files: &[(&str, i64)],
     scan_stats: &mut ScanStats,
     file_type: &str,
 ) -> Result<file_data::CacheType, Error> {
     // check how many files already cached
     let mut cached_files = HashSet::with_capacity(files.len());
-    for file in files.iter() {
+    for (file, _) in files.iter() {
         if file_data::memory::exist(file).await {
             scan_stats.querier_memory_cached_files += 1;
             cached_files.insert(file);
@@ -367,35 +430,28 @@ async fn cache_files(
     let trace_id = trace_id.to_string();
     let files = files
         .iter()
-        .filter_map(|f| {
+        .filter_map(|(f, size)| {
             if cached_files.contains(f) {
                 None
             } else {
-                Some(f.to_string())
+                Some((f.to_string(), *size))
             }
         })
         .collect_vec();
     let file_type = file_type.to_string();
     tokio::spawn(async move {
-        let files = files.iter().map(|f| f.as_str()).collect_vec();
-        for file in &files {
-            match job::queue_background_download(&trace_id, file, cache_type).await {
-                Ok(_) => {
-                    log::debug!(
-                        "[trace_id {trace_id}] file {file} successfully queued for download"
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "[trace_id {trace_id}] error in queuing file {file} for background download : {e}"
-                    );
-                }
+        let files_num = files.len();
+        for (file, size) in files {
+            if let Err(e) = job::queue_download(&file, size, cache_type).await {
+                log::error!(
+                    "[trace_id {trace_id}] error in queuing file {file} for background download: {e}"
+                );
             }
         }
         log::info!(
-            "[trace_id {}] search->storage: successfully enqueued {} files of {} for background download into {:?} ",
+            "[trace_id {}] search->storage: successfully enqueued {} files of {} for background download into {:?}",
             trace_id,
-            files.len(),
+            files_num,
             file_type,
             cache_type,
         );
@@ -448,7 +504,7 @@ pub async fn filter_file_list_by_tantivy_index(
         &query.trace_id,
         &index_file_names
             .iter()
-            .map(|(ttv_file, _)| ttv_file.as_str())
+            .map(|(ttv_file, meta)| (ttv_file.as_str(), meta.meta.index_size))
             .collect_vec(),
         &mut scan_stats,
         "index",
@@ -461,15 +517,32 @@ pub async fn filter_file_list_by_tantivy_index(
         format!("downloading others into {:?} in background,", cache_type)
     };
     log::info!(
-        "[trace_id {}] search->tantivy: stream {}/{}/{}, load puffin index files {}, memory cached {}, disk cached {}, {download_msg} took: {} ms",
-        query.trace_id,
-        query.org_id,
-        query.stream_type,
-        query.stream_name,
-        scan_stats.querier_files,
-        scan_stats.querier_memory_cached_files,
-        scan_stats.querier_disk_cached_files,
-        start.elapsed().as_millis()
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {}] search->tantivy: stream {}/{}/{}, load tantivy index files {}, memory cached {}, disk cached {}, {download_msg} took: {} ms",
+                query.trace_id,
+                query.org_id,
+                query.stream_type,
+                query.stream_name,
+                scan_stats.querier_files,
+                scan_stats.querier_memory_cached_files,
+                scan_stats.querier_disk_cached_files,
+                start.elapsed().as_millis()
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("tantivy load files".to_string())
+                .search_role("follower".to_string())
+                .duration(start.elapsed().as_millis() as usize)
+                .desc(format!(
+                    "load tantivy index files {}, memory cached {}, disk cached {}",
+                    scan_stats.querier_files,
+                    scan_stats.querier_memory_cached_files,
+                    scan_stats.querier_disk_cached_files,
+                ))
+                .build()
+        )
     );
 
     // set target partitions based on cache type
@@ -556,7 +629,15 @@ pub async fn filter_file_list_by_tantivy_index(
                     idx_optimize_rule_clone,
                     &file,
                 )
-                .await;
+                .await
+                .map_err(|e| {
+                    log::error!(
+                        "[trace_id {trace_id}] search->tantivy: error filtering via index: {}, error: {:?}",
+                        file.key,
+                        e
+                    );
+                    e
+                });
                 drop(permit);
                 ret
             });
@@ -564,10 +645,20 @@ pub async fn filter_file_list_by_tantivy_index(
         }
 
         // Wait for all tasks to complete
-        for result in try_join_all(tasks)
-            .await
-            .map_err(|e| Error::ErrorCode(ErrorCodes::ServerInternalError(e.to_string())))?
-        {
+        let tasks = match try_join_all(tasks).await {
+            Ok(results) => results,
+            Err(e) => {
+                log::error!(
+                    "[trace_id {}] search->tantivy: error filtering via index, error: {:?}",
+                    query.trace_id,
+                    e
+                );
+                return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
+                    e.to_string(),
+                )));
+            }
+        };
+        for result in tasks {
             let result: anyhow::Result<(String, Option<BitVec>, usize)> = result;
             // Each result corresponds to a file in the file list
             match result {
@@ -632,14 +723,32 @@ pub async fn filter_file_list_by_tantivy_index(
     }
 
     log::info!(
-        "[trace_id {}] search->tantivy: total hits for index_condition: {:?} found {} rows, is_add_filter_back: {}, file_num: {}, took: {} ms",
-        query.trace_id,
-        index_condition,
-        total_hits,
-        is_add_filter_back,
-        file_list_map.len(),
-        search_start.elapsed().as_millis()
+        "{}",
+        search_inspector_fields(
+            format!(
+                "[trace_id {}] search->tantivy: total hits for index_condition: {:?} found {} rows, is_add_filter_back: {}, file_num: {}, took: {} ms",
+                query.trace_id,
+                index_condition,
+                total_hits,
+                is_add_filter_back,
+                file_list_map.len(),
+                search_start.elapsed().as_millis()
+            ),
+            SearchInspectorFieldsBuilder::new()
+                .node_name(LOCAL_NODE.name.clone())
+                .component("tantivy search".to_string())
+                .search_role("follower".to_string())
+                .duration(search_start.elapsed().as_millis() as usize)
+                .desc(format!(
+                    "found {} rows, is_add_filter_back: {}, file_num: {}",
+                    total_hits,
+                    is_add_filter_back,
+                    file_list_map.len(),
+                ))
+                .build()
+        )
     );
+
     file_list.extend(file_list_map.into_values());
     Ok((
         start.elapsed().as_millis() as usize,
@@ -688,7 +797,10 @@ async fn search_tantivy_index(
     let (tantivy_index, tantivy_reader) = match indexer {
         Some((indexer, reader)) => (indexer, reader),
         None => {
-            log::debug!("init cache for puffin file: {}", ttv_file_name);
+            log::debug!(
+                "[trace_id {trace_id}] init cache for tantivy file: {}",
+                ttv_file_name
+            );
             let reader_directory: Box<dyn Directory> = if cfg.common.inverted_index_tantivy_mode
                 == InvertedIndexTantivyMode::Mmap.to_string()
             {

@@ -34,9 +34,12 @@ use config::{
         json::{Map, Value},
     },
 };
+use tracing::Instrument;
 
 use super::promql;
-use crate::service::{search as SearchService, self_reporting::http_report_metrics};
+use crate::service::{
+    search as SearchService, self_reporting::http_report_metrics, setup_tracing_with_trace_id,
+};
 
 pub mod alert;
 pub mod derived_streams;
@@ -61,6 +64,7 @@ pub trait QueryConditionExt: Sync + Send + 'static {
         (start_time, end_time): (Option<i64>, i64),
         search_type: Option<SearchEventType>,
         search_event_context: Option<SearchEventContext>,
+        trace_id: Option<String>,
     ) -> Result<TriggerEvalResults, anyhow::Error>;
 }
 
@@ -106,7 +110,16 @@ impl QueryConditionExt for QueryCondition {
         (start_time, end_time): (Option<i64>, i64),
         search_type: Option<SearchEventType>,
         search_event_context: Option<SearchEventContext>,
+        trace_id: Option<String>,
     ) -> Result<TriggerEvalResults, anyhow::Error> {
+        let trace_id = trace_id.unwrap_or_else(ider::generate_trace_id);
+        // create context with trace_id
+        let eval_span = setup_tracing_with_trace_id(
+            &trace_id,
+            tracing::info_span!("service:alerts:evaluate_scheduled"),
+        )
+        .await;
+
         let mut eval_results = TriggerEvalResults {
             end_time,
             ..Default::default()
@@ -167,7 +180,7 @@ impl QueryConditionExt for QueryCondition {
                     query_exemplars: false,
                     no_cache: None,
                 };
-                let resp = match promql::search::search("", org_id, &req, "", 0).await {
+                let resp = match promql::search::search(&trace_id, org_id, &req, "", 0).await {
                     Ok(v) => v,
                     Err(_) => {
                         return Ok(eval_results);
@@ -175,7 +188,7 @@ impl QueryConditionExt for QueryCondition {
                 };
                 let promql::value::Value::Matrix(value) = resp else {
                     log::warn!(
-                        "Alert evaluate: PromQL query {} returned unexpected response: {:?}",
+                        "Alert evaluate: trace_id: {trace_id}, PromQL query {} returned unexpected response: {:?}",
                         v,
                         resp
                     );
@@ -247,7 +260,6 @@ impl QueryConditionExt for QueryCondition {
         } else {
             std::cmp::max(100, trigger_condition.threshold)
         };
-        let trace_id = ider::uuid();
 
         let req_start = std::time::Instant::now();
         let resp = if self.multi_time_range.is_some()
@@ -337,10 +349,20 @@ impl QueryConditionExt for QueryCondition {
                 per_query_response: false, // Will return results in single array
             };
             log::debug!(
-                "evaluate_scheduled begin to call SearchService::search_multi, {:?}",
+                "evaluate_scheduled trace_id: {trace_id}, begin to call SearchService::search_multi, {:?}",
                 req
             );
-            SearchService::search_multi(&trace_id, org_id, stream_type, None, &req).await
+            SearchService::grpc_search::grpc_search_multi(
+                &trace_id,
+                org_id,
+                stream_type,
+                None,
+                &req,
+                Some(RoleGroup::Background),
+            )
+            .instrument(eval_span)
+            .await
+            // SearchService::search_multi(&trace_id, org_id, stream_type, None, &req).await
         } else {
             // fire the query
             let req = config::meta::search::Request {
@@ -382,7 +404,7 @@ impl QueryConditionExt for QueryCondition {
                 local_mode: None,
             };
             log::debug!(
-                "evaluate_scheduled begin to call SearchService::search, {:?}",
+                "evaluate_scheduled trace_id: {trace_id}, begin to call SearchService::search, {:?}",
                 req
             );
             // SearchService::search(&trace_id, org_id, stream_type, None, &req).await
@@ -394,6 +416,7 @@ impl QueryConditionExt for QueryCondition {
                 &req,
                 Some(RoleGroup::Background),
             )
+            .instrument(eval_span)
             .await
         };
 
@@ -446,7 +469,10 @@ impl QueryConditionExt for QueryCondition {
                 _ => {}
             }
         });
-        log::debug!("alert resp hits len:{:#?}", records.len());
+        log::debug!(
+            "alert trace_id: {trace_id}, resp hits len:{:#?}",
+            records.len()
+        );
         eval_results.query_took = Some(resp.took as i64);
         eval_results.data = if self.search_event_type.is_none() {
             let threshold = trigger_condition.threshold as usize;

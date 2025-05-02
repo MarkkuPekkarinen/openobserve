@@ -358,7 +358,7 @@ impl FromRequest for AuthExtractor {
                     OFGA_MODELS.get("streams").unwrap().key,
                     path_columns[1]
                 )
-            } else if method.eq("PUT")
+            } else if (method.eq("PUT") && !path_columns[1].starts_with("ratelimit"))
                 || method.eq("DELETE")
                 || path_columns[1].eq("reports")
                 || path_columns[1].eq("savedviews")
@@ -396,6 +396,12 @@ impl FromRequest for AuthExtractor {
             } else {
                 // for things like dashboards and folders etc,
                 // this will take form org:dashboard or org:folders
+
+                // handle ratelimit:org
+                if method.eq("GET") && path_columns[1].starts_with("ratelimit") {
+                    method = "LIST".to_string();
+                }
+
                 format!(
                     "{}:{}",
                     OFGA_MODELS
@@ -667,6 +673,19 @@ impl FromRequest for AuthExtractor {
                 } else {
                     object_type
                 };
+                // Currently, we have a patch api for dashboard move,
+                // which can not be handled by the middleware layer,
+                // so we need to bypass the check here
+                if method.eq("PATCH") {
+                    return ready(Ok(AuthExtractor {
+                        auth: auth_str.to_owned(),
+                        method: "".to_string(),
+                        o2_type: "".to_string(),
+                        org_id: "".to_string(),
+                        bypass_check: true, // bypass check permissions
+                        parent_id: folder,
+                    }));
+                }
 
                 return ready(Ok(AuthExtractor {
                     auth: auth_str.to_owned(),
@@ -711,7 +730,9 @@ impl FromRequest for AuthExtractor {
     #[cfg(not(feature = "enterprise"))]
     fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
         let auth_str = if let Some(cookie) = req.cookie("auth_tokens") {
-            let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+            let val = config::utils::base64::decode_raw(cookie.value()).unwrap_or_default();
+            let auth_tokens: AuthTokens =
+                json::from_str(std::str::from_utf8(&val).unwrap_or_default()).unwrap_or_default();
             let access_token = auth_tokens.access_token;
             if access_token.starts_with("Basic") || access_token.starts_with("Bearer") {
                 access_token
@@ -750,12 +771,17 @@ impl FromRequest for AuthExtractor {
 pub fn extract_auth_str(req: &HttpRequest) -> String {
     let auth_ext_cookie = |req: &HttpRequest| -> String {
         req.cookie("auth_ext")
-            .map(|cookie| cookie.value().to_string())
+            .map(|cookie| {
+                let val = config::utils::base64::decode_raw(cookie.value()).unwrap_or_default();
+                std::str::from_utf8(&val).unwrap_or_default().to_string()
+            })
             .unwrap_or_default()
     };
 
     if let Some(cookie) = req.cookie("auth_tokens") {
-        let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+        let val = config::utils::base64::decode_raw(cookie.value()).unwrap_or_default();
+        let auth_tokens: AuthTokens =
+            json::from_str(std::str::from_utf8(&val).unwrap_or_default()).unwrap_or_default();
         let access_token = auth_tokens.access_token;
         if access_token.is_empty() {
             // If cookie was set but access token is still empty
@@ -775,7 +801,8 @@ pub fn extract_auth_str(req: &HttpRequest) -> String {
             format!("Bearer {}", access_token)
         }
     } else if let Some(cookie) = req.cookie("auth_ext") {
-        cookie.value().to_string()
+        let val = config::utils::base64::decode_raw(cookie.value()).unwrap_or_default();
+        std::str::from_utf8(&val).unwrap_or_default().to_string()
     } else if let Some(auth_header) = req.headers().get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             auth_str.to_owned()
@@ -1012,6 +1039,7 @@ mod tests {
                 first_name: "root".to_owned(),
                 last_name: "".to_owned(),
                 is_external: false,
+                token: None,
             },
         )
         .await;

@@ -63,11 +63,14 @@ impl From<DashboardError> for HttpResponse {
             }
             DashboardError::ListPermittedDashboardsError(err) => MetaHttpResponse::forbidden(err),
             DashboardError::UserNotFound => MetaHttpResponse::unauthorized("User not found"),
+            DashboardError::PermissionDenied => MetaHttpResponse::forbidden("Permission denied"),
         }
     }
 }
 
 /// CreateDashboard
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"create"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -117,6 +120,8 @@ pub async fn create_dashboard(
 }
 
 /// UpdateDashboard
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"update"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -169,6 +174,8 @@ async fn update_dashboard(
 }
 
 /// ListDashboards
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"list"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -202,6 +209,8 @@ async fn list_dashboards(org_id: web::Path<String>, req: HttpRequest) -> impl Re
 }
 
 /// GetDashboard
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"get"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -230,6 +239,8 @@ async fn get_dashboard(path: web::Path<(String, String)>) -> impl Responder {
 }
 
 /// DeleteDashboard
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"delete"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -260,6 +271,8 @@ async fn delete_dashboard(path: web::Path<(String, String)>) -> impl Responder {
 }
 
 /// MoveDashboard
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"update"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -288,9 +301,19 @@ async fn delete_dashboard(path: web::Path<(String, String)>) -> impl Responder {
 async fn move_dashboard(
     path: web::Path<(String, String)>,
     req_body: web::Json<MoveDashboardRequestBody>,
+    user_email: UserEmail,
 ) -> impl Responder {
     let (org_id, dashboard_id) = path.into_inner();
-    match dashboards::move_dashboard(&org_id, &dashboard_id, &req_body.to).await {
+    // For this endpoint, openfga check is already done in the middleware
+    match dashboards::move_dashboard(
+        &org_id,
+        &dashboard_id,
+        &req_body.to,
+        &user_email.user_id,
+        false,
+    )
+    .await
+    {
         Ok(()) => HttpResponse::Ok().json(MetaHttpResponse::message(
             http::StatusCode::OK.into(),
             "Dashboard moved".to_string(),
@@ -299,6 +322,9 @@ async fn move_dashboard(
     }
 }
 
+/// MoveDashboards
+///
+/// #{"ratelimit_module":"Dashboards", "ratelimit_module_operation":"update"}#
 #[utoipa::path(
     context_path = "/api",
     tag = "Dashboards",
@@ -320,10 +346,19 @@ async fn move_dashboard(
 async fn move_dashboards(
     path: web::Path<String>,
     req_body: web::Json<MoveDashboardsRequestBody>,
+    user_email: UserEmail,
 ) -> HttpResponse {
     let org_id = path.into_inner();
-    match dashboards::move_dashboards(&org_id, &req_body.dashboard_ids, &req_body.dst_folder_id)
-        .await
+    // For this endpoint, openfga check is needed here, as we don't do openfga check in the
+    // middleware for this api endpoint, because it includes a batch of dashboards
+    match dashboards::move_dashboards(
+        &org_id,
+        &req_body.dashboard_ids,
+        &req_body.dst_folder_id,
+        &user_email.user_id,
+        true,
+    )
+    .await
     {
         Ok(_) => {
             let message = if req_body.dashboard_ids.len() == 1 {

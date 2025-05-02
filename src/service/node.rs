@@ -65,8 +65,7 @@ pub fn config_node_to_proto(node: ConfigNode) -> NodeDetails {
         tcp_conns_established: node.metrics.tcp_conns_established as u64,
         tcp_conns_close_wait: node.metrics.tcp_conns_close_wait as u64,
         tcp_conns_time_wait: node.metrics.tcp_conns_time_wait as u64,
-        open_fds: node.metrics.open_fds as u64,
-        tcp_conn_resets: node.metrics.tcp_conn_resets as u64,
+        tcp_conns_resets: node.metrics.tcp_conns_resets as u64,
     };
 
     NodeDetails {
@@ -131,8 +130,7 @@ pub fn proto_node_to_config(node: NodeDetails) -> ConfigNode {
                 tcp_conns_established: m.tcp_conns_established as usize,
                 tcp_conns_close_wait: m.tcp_conns_close_wait as usize,
                 tcp_conns_time_wait: m.tcp_conns_time_wait as usize,
-                open_fds: m.open_fds as usize,
-                tcp_conn_resets: m.tcp_conn_resets as usize,
+                tcp_conns_resets: m.tcp_conns_resets as usize,
             }
         });
 
@@ -174,15 +172,20 @@ impl proto::cluster_rpc::node_service_server::NodeService for NodeService {
     }
 }
 
-pub async fn get_node_list(node: Arc<dyn NodeInfo>) -> Result<Vec<ConfigNode>, anyhow::Error> {
+pub async fn get_node_list(
+    trace_id: &str,
+    node: Arc<dyn NodeInfo>,
+) -> Result<Vec<ConfigNode>, anyhow::Error> {
     let mut nodes = Vec::new();
 
     // Create a task to fetch nodes from this cluster node
+    let trace_id = trace_id.to_string();
     let task: tokio::task::JoinHandle<Result<Vec<NodeDetails>, infra::errors::Error>> =
         tokio::task::spawn(async move {
             let empty_request = EmptyRequest {};
             let mut request = Request::new(empty_request.clone());
-            let mut client = super::grpc::make_grpc_node_client(&mut request, &node).await?;
+            let mut client =
+                super::grpc::make_grpc_node_client(&trace_id, &mut request, &node).await?;
             let nodes = match client.get_nodes(Request::new(empty_request)).await {
                 Ok(remote_nodes) => remote_nodes.into_inner().nodes,
                 Err(err) => {
@@ -228,8 +231,4 @@ pub async fn get_node_list(node: Arc<dyn NodeInfo>) -> Result<Vec<ConfigNode>, a
     }
 
     Ok(nodes)
-}
-
-pub fn node_service() -> proto::cluster_rpc::node_service_server::NodeServiceServer<NodeService> {
-    proto::cluster_rpc::node_service_server::NodeServiceServer::new(NodeService)
 }

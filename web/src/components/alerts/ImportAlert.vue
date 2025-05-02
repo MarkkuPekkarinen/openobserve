@@ -49,6 +49,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           padding="sm xl"
           no-caps
           @click="importJson"
+          :loading="isAlertImporting"
+          :disable="isAlertImporting"
           data-test="alert-import-json-btn"
         />
       </div>
@@ -395,6 +397,39 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                           />
                         </div>
                       </span>
+                      <span
+                        class="text-red"
+                        v-else-if="
+                          typeof errorMessage === 'object' &&
+                          errorMessage.field == 'org_id'
+                        "
+                      >
+                        {{ errorMessage.message }}
+                        <div style="width: 300px">
+                          <q-select
+                            data-test="alert-import-org-id-input"
+                            v-model="userSelectedOrgId[index]"
+                            :options="organizationDataList"
+                            :label="'Organization Id'"
+                            :popup-content-style="{
+                              textTransform: 'lowercase',
+                            }"
+                            color="input-border"
+                            bg-color="input-bg"
+                            class="q-py-sm showLabelOnTop no-case"
+                            filled
+                            stack-label
+                            dense
+                            use-input
+                            hide-selected
+                            fill-input
+                            :input-debounce="400"
+                            @update:model-value="updateOrgId(userSelectedOrgId[index].value, index)"
+                            behavior="menu"
+                          >
+                          </q-select>
+                        </div>
+                      </span>
 
                       <span v-else>{{ errorMessage }}</span>
                     </div>
@@ -522,6 +557,18 @@ export default defineComponent({
     const selectedFolderId = ref<any>(router.currentRoute.value.query.folder || "default");
     const activeFolderId = ref(router.currentRoute.value.query.folder || router.currentRoute.value.query?.folderId);
     const activeFolderAlerts = ref<any>([]);
+    const isAlertImporting = ref(false);
+    const userSelectedOrgId = ref<any[]>([]);
+    const organizationDataList = computed(() => {
+        return store.state.organizations.map((org: any) => {
+          return {
+            label: org.identifier,
+            value: org.identifier,
+            disable: !org.identifier || org.identifier !== store.state.selectedOrganization.identifier
+          };
+        });
+      });
+
     const getFormattedDestinations: any = computed(() => {
       return props.destinations.map((destination: any) => {
         return destination.name;
@@ -688,6 +735,9 @@ export default defineComponent({
       }
 
       let allAlertsCreated = true;
+      // made the isAlertImporting to true to disable the import button
+      // and also added a spinner to the import button
+      isAlertImporting.value = true;
       // Now we can always process as an array
       for (const [index, jsonObj] of jsonArrayOfObj.value.entries()) {
         const success = await processJsonObject(jsonObj, index + 1);
@@ -710,6 +760,9 @@ export default defineComponent({
           },
         });
       }
+      //if the alerts created successfully or not make the isAlertImporting to false
+      //it will only enable the import button after the alerts are created successfully
+      isAlertImporting.value = false;
     };
 
     const processJsonObject = async (jsonObj: any, index: number) => {
@@ -748,17 +801,10 @@ export default defineComponent({
           field: "alert_name",
         });
       }
-      if (checkAlertsInList(activeFolderAlerts.value, input.name)) {
-        alertErrors.push({
-          message: `Alert - ${index}: "${input.name}" already exists`,
-          field: "alert_name",
-        });
-      }
       const organizationData = store.state.organizations;
       const orgList = organizationData.map((org: any) => org.identifier);
 
       // 2. Validate 'org_id' field
-      console.log(input.org_id,'org id')
       if (
         !input.org_id ||
         typeof input.org_id !== "string" ||
@@ -766,7 +812,10 @@ export default defineComponent({
         input.org_id != store.state.selectedOrganization.identifier
       ) {
         alertErrors.push(
-          `Alert - ${index}: Organization Id is mandatory, should exist in organization list and should be equal to ${store.state.selectedOrganization.identifier}.`,
+          {
+            message: `Alert - ${index}: Organization Id is mandatory, should exist in organization list and should be equal to ${store.state.selectedOrganization.identifier}.`,
+            field: "org_id",
+          }
         );
       }
 
@@ -909,7 +958,6 @@ export default defineComponent({
           `Alert - ${index}: Operator should be one of: '=', '!=', '>=', '<=', '>', '<', 'Contains', 'NotContains'.`,
         );
       }
-      console.log(input,'input')
 
 
       if (
@@ -1048,6 +1096,11 @@ export default defineComponent({
         input.trigger_condition.tolerance_in_secs = null;
       }
       input.folder_id = folderId;
+      //assigning the owner from the alert payload because the current logged in user will be the owner of the alert
+        input.owner = store.state.userInfo.email;
+      //assigning the last_edited_by from the alert payload because the current logged in user will be the last_edited_by of the alert
+        input.last_edited_by = store.state.userInfo.email;
+      
       try {
         await alertsService.create_by_alert_id(
           store.state.selectedOrganization.identifier,
@@ -1168,6 +1221,10 @@ export default defineComponent({
         activeFolderAlerts.value = store.state.organizationData.allAlertsListByNames[folderId];
       
     }
+    const updateOrgId = (orgId: string, index: number) => {
+      jsonArrayOfObj.value[index].org_id = orgId;
+      jsonStr.value = JSON.stringify(jsonArrayOfObj.value, null, 2);
+    }
 
     return {
       t,
@@ -1214,7 +1271,11 @@ export default defineComponent({
       selectedFolderId,
       getActiveFolderAlerts,
       activeFolderAlerts,
-      store
+      store,
+      isAlertImporting,
+      organizationDataList,
+      userSelectedOrgId,
+      updateOrgId,
     };
   },
   components: {

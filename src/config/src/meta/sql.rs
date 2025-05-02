@@ -50,7 +50,7 @@ pub fn resolve_stream_names(sql: &str) -> Result<Vec<String>, anyhow::Error> {
     let dialect = &PostgreSqlDialect {};
     let statement = DFParser::parse_sql_with_dialect(sql, dialect)?
         .pop_back()
-        .unwrap();
+        .ok_or(anyhow::anyhow!("Failed to parse sql"))?;
     let (table_refs, _) = resolve_table_references(&statement, true)?;
     let mut tables = Vec::new();
     for table in table_refs {
@@ -63,7 +63,7 @@ pub fn resolve_stream_names_with_type(sql: &str) -> Result<Vec<TableReference>, 
     let dialect = &PostgreSqlDialect {};
     let statement = DFParser::parse_sql_with_dialect(sql, dialect)?
         .pop_back()
-        .unwrap();
+        .ok_or(anyhow::anyhow!("Failed to parse sql"))?;
     let (table_refs, _) = resolve_table_references(&statement, true)?;
     let mut tables = Vec::new();
     for table in table_refs {
@@ -149,6 +149,7 @@ pub struct Limit<'a>(pub &'a SqlExpr);
 pub struct Where<'a>(pub &'a Option<SqlExpr>);
 
 impl Sql {
+    #[deprecated(since = "0.14.5", note = "use service::search::Sql::new instead")]
     pub fn new(sql: &str) -> Result<Sql, anyhow::Error> {
         if sql.is_empty() {
             return Err(anyhow::anyhow!("SQL is empty"));
@@ -1070,6 +1071,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sql_new() {
         let table = "index.1.2022";
         let sql = format!(
@@ -1085,6 +1087,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sql_parse() {
         let sqls = [
             ("select * from table1", true),
@@ -1124,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sql_parse_timerange() {
         let samples = [
             ("select * from tbl where ts in (1, 2, 3)", (0,0)),
@@ -1152,6 +1156,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_sql_parse_fields() {
         let samples = [
             ("select * FROM tbl", vec![]),
@@ -1226,5 +1231,28 @@ mod tests {
         let sql = "select * from \"log\".default";
         let names = resolve_stream_names_with_type(sql).unwrap();
         println!("{:?}", names);
+    }
+
+    #[test]
+    fn test_resolve_stream_names_error() {
+        let sql = "";
+        let names = resolve_stream_names_with_type(sql);
+        assert!(names.is_err());
+        assert!(
+            names
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Failed to parse sql")
+        );
+        let names = resolve_stream_names(sql);
+        assert!(names.is_err());
+        assert!(
+            names
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Failed to parse sql")
+        );
     }
 }

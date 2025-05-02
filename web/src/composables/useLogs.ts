@@ -755,24 +755,24 @@ const useLogs = () => {
         req["clusters"] = searchObj.meta.clusters;
       }
 
-      if (searchObj.data.stream.selectedStreamFields.length == 0) {
-        const streamData: any = getStreams(
-          searchObj.data.stream.streamType,
-          true,
-          true,
-        );
+      // if (searchObj.data.stream.selectedStreamFields.length == 0) {
+      //   const streamData: any = getStreams(
+      //     searchObj.data.stream.streamType,
+      //     true,
+      //     true,
+      //   );
 
-        searchObj.data.stream.selectedStreamFields = streamData.schema;
+      //   searchObj.data.stream.selectedStreamFields = streamData.schema;
 
-        if (
-          !searchObj.data.stream.selectedStreamFields ||
-          searchObj.data.stream.selectedStreamFields.length == 0
-        ) {
-          searchObj.data.stream.selectedStreamFields = [];
-          searchObj.loading = false;
-          return false;
-        }
-      }
+      //   if (
+      //     !searchObj.data.stream.selectedStreamFields ||
+      //     searchObj.data.stream.selectedStreamFields.length == 0
+      //   ) {
+      //     searchObj.data.stream.selectedStreamFields = [];
+      //     searchObj.loading = false;
+      //     return false;
+      //   }
+      // }
 
       const streamFieldNames: any =
         searchObj.data.stream.selectedStreamFields.map(
@@ -879,33 +879,42 @@ const useLogs = () => {
 
         searchObj.data.query = query;
         const parsedSQL: any = fnParsedSQL();
-        const histogramParsedSQL: any = fnHistogramParsedSQL(
-          req.aggs.histogram,
-        );
+        if (parsedSQL != undefined) {
+          const histogramParsedSQL: any = fnHistogramParsedSQL(
+            req.aggs.histogram,
+          );
 
-        histogramParsedSQL.where = parsedSQL.where;
+          histogramParsedSQL.where = parsedSQL.where;
 
-        let histogramQuery = fnUnparsedSQL(histogramParsedSQL);
-        histogramQuery = histogramQuery.replace(/`/g, '"');
-        req.aggs.histogram = histogramQuery;
+          let histogramQuery = fnUnparsedSQL(histogramParsedSQL);
+          histogramQuery = histogramQuery.replace(/`/g, '"');
+          req.aggs.histogram = histogramQuery;
 
-        if (!parsedSQL?.columns?.length) {
-          notificationMsg.value = "No column found in selected stream.";
-          return false;
-        }
+          //check if query is valid or not , if the query is invalid --> empty query
 
-        if (parsedSQL.limit != null && parsedSQL.limit.value.length != 0) {
-          req.query.size = parsedSQL.limit.value[0].value;
-
-          if (parsedSQL.limit.separator == "offset") {
-            req.query.from = parsedSQL.limit.value[1].value || 0;
+          if(Array.isArray(parsedSQL) && parsedSQL.length == 0){
+            notificationMsg.value = "SQL query is missing or invalid. Please submit a valid SQL statement.";
+            return false;
           }
 
-          query = fnUnparsedSQL(parsedSQL);
+          if (!parsedSQL?.columns?.length && !searchObj.meta.sqlMode) {
+            notificationMsg.value = "No column found in selected stream.";
+            return false;
+          }
 
-          //replace backticks with \" for sql_mode
-          query = query.replace(/`/g, '"');
-          searchObj.data.queryResults.hits = [];
+          if (parsedSQL.limit != null && parsedSQL.limit.value.length != 0) {
+            req.query.size = parsedSQL.limit.value[0].value;
+
+            if (parsedSQL.limit.separator == "offset") {
+              req.query.from = parsedSQL.limit.value[1].value || 0;
+            }
+
+            query = fnUnparsedSQL(parsedSQL);
+
+            //replace backticks with \" for sql_mode
+            query = query.replace(/`/g, '"');
+            searchObj.data.queryResults.hits = [];
+          }
         }
 
         req.query.sql = query;
@@ -1099,8 +1108,8 @@ const useLogs = () => {
       if (store.state.zoConfig.sql_base64_enabled) {
         req["encoding"] = "base64";
         req.query.sql = b64EncodeUnicode(req.query.sql);
+        //encode the histogram only if the current page is 1 
         if (
-          !searchObj.meta.sqlMode &&
           searchObj.data.resultGrid.currentPage == 1
         ) {
           req.aggs.histogram = b64EncodeUnicode(req.aggs.histogram);
@@ -1125,6 +1134,10 @@ const useLogs = () => {
     return parsedSQL?.distinct?.type === "DISTINCT";
   };
 
+  const isWithQuery = (parsedSQL: any = null) => {
+    return parsedSQL?.with && parsedSQL?.with?.length > 0;
+  };
+
   const getQueryPartitions = async (queryReq: any) => {
     try {
       // const queryReq = buildSearch();
@@ -1144,11 +1157,11 @@ const useLogs = () => {
 
       const parsedSQL: any = fnParsedSQL();
 
-      if (searchObj.meta.sqlMode && parsedSQL == undefined) {
-        searchObj.data.queryResults.error =
-          "Error while search partition. Search query is invalid.";
-        return;
-      }
+      // if (searchObj.meta.sqlMode && parsedSQL == undefined) {
+      //   searchObj.data.queryResults.error =
+      //     "Error while search partition. Search query is invalid.";
+      //   return;
+      // }
 
       // In Limit we don't need to get partitions, as we directly hit search request with query limit
       if (
@@ -1401,7 +1414,7 @@ const useLogs = () => {
             searchObj.meta.showHistogram == true &&
             searchObj.data.stream.selectedStream.length <= 1 &&
             (!searchObj.meta.sqlMode ||
-              (searchObj.meta.sqlMode && !isLimitQuery(parsedSQL)))) ||
+              (searchObj.meta.sqlMode && !isLimitQuery(parsedSQL) && !isDistinctQuery(parsedSQL) && !isWithQuery(parsedSQL)))) ||
           (searchObj.loadingHistogram == false &&
             searchObj.meta.showHistogram == true &&
             searchObj.data.stream.selectedStream.length <= 1 &&
@@ -1597,6 +1610,11 @@ const useLogs = () => {
         searchObjDebug["partitionEndTime"] = performance.now();
       }
 
+      //reset the plot chart when the query is run 
+      //this is to avoid the issue of chart not updating when histogram is disabled and enabled and clicking the run query button
+      //only reset the plot chart when the query is not run for pagination
+      if(!isPagination) searchObj.meta.resetPlotChart = true;
+
       if (queryReq != null) {
         // in case of live refresh, reset from to 0
         if (
@@ -1762,7 +1780,6 @@ const useLogs = () => {
               }
 
               await generateHistogramSkeleton();
-
               for (const partition of partitions) {
                 searchObj.data.histogramQuery.query.start_time = partition[0];
                 searchObj.data.histogramQuery.query.end_time = partition[1];
@@ -1797,9 +1814,11 @@ const useLogs = () => {
           refreshPartitionPagination(true);
         } else if (searchObj.meta.sqlMode && isLimitQuery(parsedSQL)) {
           resetHistogramWithError(
-            "Histogram is not available for limit queries.",
+            "Histogram unavailable for CTEs, DISTINCT and LIMIT queries.",
+            -1
           );
-        } else if (searchObj.meta.sqlMode && isDistinctQuery(parsedSQL)) {
+          searchObj.meta.histogramDirtyFlag = false;
+        } else if (searchObj.meta.sqlMode && (isDistinctQuery(parsedSQL) || isWithQuery(parsedSQL))) {
           let aggFlag = false;
           if (parsedSQL) {
             aggFlag = hasAggregation(parsedSQL?.columns);
@@ -1816,10 +1835,22 @@ const useLogs = () => {
               searchObjDebug["pagecountEndTime"] = performance.now();
             }, 0);
           }
-          resetHistogramWithError(
-            "Histogram is not available for DISTINCT queries.",
-          );
-        } else {
+          if(isWithQuery(parsedSQL)){
+            resetHistogramWithError(
+              "Histogram unavailable for CTEs, DISTINCT and LIMIT queries.",
+              -1
+            );
+          }
+          else{
+            resetHistogramWithError(
+              "Histogram unavailable for CTEs, DISTINCT and LIMIT queries",
+              -1
+            );
+
+          }
+          searchObj.meta.histogramDirtyFlag = false;
+        } 
+        else {
           let aggFlag = false;
           if (parsedSQL) {
             aggFlag = hasAggregation(parsedSQL?.columns);
@@ -2263,7 +2294,7 @@ const useLogs = () => {
       }
       const parsedSQL: any = fnParsedSQL();
       searchObj.meta.resultGrid.showPagination = true;
-      if (searchObj.meta.sqlMode == true) {
+      if (searchObj.meta.sqlMode == true && parsedSQL != undefined) {
         // if query has aggregation or groupby then we need to set size to -1 to get all records
         // issue #5432
         if (hasAggregation(parsedSQL?.columns) || parsedSQL.groupby != null) {
@@ -2281,7 +2312,7 @@ const useLogs = () => {
           delete queryReq.query.track_total_hits;
         }
 
-        if (isDistinctQuery(parsedSQL)) {
+        if (isDistinctQuery(parsedSQL) || isWithQuery(parsedSQL)) {
           delete queryReq.query.track_total_hits;
         }
       }
@@ -2362,7 +2393,7 @@ const useLogs = () => {
 
           searchAggData.total = 0;
           searchAggData.hasAggregation = false;
-          if (searchObj.meta.sqlMode == true) {
+          if (searchObj.meta.sqlMode == true && parsedSQL != undefined) {
             if (
               hasAggregation(parsedSQL?.columns) ||
               parsedSQL.groupby != null
@@ -2593,7 +2624,6 @@ const useLogs = () => {
 
   const getHistogramQueryData = (queryReq: any) => {
     return new Promise((resolve, reject) => {
-      searchObj.meta.resetPlotChart = true;
       if (searchObj.data.isOperationCancelled) {
         searchObj.loadingHistogram = false;
         searchObj.data.isOperationCancelled = false;
@@ -3230,7 +3260,7 @@ const useLogs = () => {
 
               // Object.keys(recordwithMaxAttribute).forEach((key) => {
               for (const key of Object.keys(recordwithMaxAttribute)) {
-                if (key == "_o2_id" || key == "_original") {
+                if (key == "_o2_id" || key == "_original" || key == "_all_values") {
                   continue;
                 }
                 if (key == store.state.zoConfig.timestamp_column) {
@@ -4253,9 +4283,11 @@ const useLogs = () => {
 
       // Update selectedStreamFields once
       searchObj.data.stream.selectedStreamFields = allStreamFields;
-
+      //check if allStreamFields is empty or not 
+      //if empty then we are displaying no events found... message on the UI instead of throwing in an error format
       if (allStreamFields.length === 0) {
-        searchObj.data.errorMsg = t("search.noFieldFound");
+
+        // searchObj.data.errorMsg = t("search.noFieldFound");
         return;
       }
 
@@ -4562,9 +4594,40 @@ const useLogs = () => {
 
       const newSelectedStreams: string[] = [];
 
+      // handled WITH query
+      if (parsedSQL?.with) {
+        let withObj = parsedSQL.with;
+        withObj.forEach((obj: any) => {
+          // Map through each "from" array in the _next object, as it can contain multiple tables
+          if (obj?.stmt?.from) {
+            obj?.stmt?.from.forEach((stream: { table: string }) => {
+              newSelectedStreams.push(stream.table);
+            }
+            );
+          }
+        });
+      }
+      // additionally, if union is there then it will have _next object which will have the table name it should check recursuvely as user can write multiple union
+      else if (parsedSQL?._next) {
+        //get the first table if it is next 
+        //this is to handle the union queries when user selects the multi stream selection the first table will be there in from array
+        newSelectedStreams.push(...parsedSQL.from.map((stream: any) => {
+          return stream.table}));
+        let nextTable = parsedSQL._next;
+        //this will handle the union queries
+        while (nextTable) {
+          // Map through each "from" array in the _next object, as it can contain multiple tables
+          if (nextTable.from) {
+            nextTable.from.forEach((stream: { table: string }) =>
+              newSelectedStreams.push(stream.table),
+            );
+          }
+          nextTable = nextTable._next;
+        }
+      }
       //for simple query get the table name from the parsedSQL object
       // this will handle joins as well
-      if (parsedSQL?.from) {
+      else if (parsedSQL?.from) {
         parsedSQL.from.map((stream: any) => {
           // Check if 'expr' and 'ast' exist, then access 'from' to get the table
           if (stream.expr?.ast?.from) {
@@ -4579,20 +4642,6 @@ const useLogs = () => {
             newSelectedStreams.push(stream.table);
           }
         });
-      }
-
-      // additionally, if union is there then it will have _next object which will have the table name it should check recursuvely as user can write multiple union
-      if (parsedSQL?._next) {
-        let nextTable = parsedSQL._next;
-        while (nextTable) {
-          // Map through each "from" array in the _next object, as it can contain multiple tables
-          if (nextTable.from) {
-            nextTable.from.forEach((stream: { table: string }) =>
-              newSelectedStreams.push(stream.table),
-            );
-          }
-          nextTable = nextTable._next;
-        }
       }
 
       if (
@@ -4870,7 +4919,7 @@ const useLogs = () => {
           delete queryReq.query.track_total_hits;
         }
 
-        if (isDistinctQuery(parsedSQL)) {
+        if (isDistinctQuery(parsedSQL) || isWithQuery(parsedSQL)) {
           delete queryReq.query.track_total_hits;
         }
       }
@@ -4896,7 +4945,7 @@ const useLogs = () => {
   const buildWebSocketPayload = (
     queryReq: SearchRequestPayload,
     isPagination: boolean,
-    type: "search" | "histogram" | "pageCount",
+    type: "search" | "histogram" | "pageCount" | "values",
     meta?: any,
   ) => {
     const { traceId } = generateTraceContext();
@@ -4904,7 +4953,7 @@ const useLogs = () => {
 
     const payload: {
       queryReq: SearchRequestPayload;
-      type: "search" | "histogram" | "pageCount";
+      type: "search" | "histogram" | "pageCount" | "values";
       isPagination: boolean;
       traceId: string;
       org_id: string;
@@ -4932,7 +4981,7 @@ const useLogs = () => {
   };
 
 
-  const handleSearchReset = async (data: any) => {
+  const handleSearchReset = async (data: any, traceId?: string) => {
     // reset query data
     try {
       if(data.type === "search") {
@@ -5061,12 +5110,13 @@ const useLogs = () => {
     payload: WebSocketSearchPayload,
     response: WebSocketSearchResponse | WebSocketErrorResponse,
   ) => {
-    searchPartitionMap[payload.traceId] = searchPartitionMap[payload.traceId]
+    if (response.type === "search_response") {
+      
+      searchPartitionMap[payload.traceId] = searchPartitionMap[payload.traceId]
       ? searchPartitionMap[payload.traceId]
       : 0;
-    searchPartitionMap[payload.traceId]++;
+      searchPartitionMap[payload.traceId]++;
 
-    if (response.type === "search_response") {
       if (payload.type === "search") {
         handleLogsResponse(
           payload.queryReq,
@@ -5197,16 +5247,10 @@ const useLogs = () => {
             response.content.results.scan_size;
         } else {
           if (response.content?.streaming_aggs) {
-            if (!Object.keys(searchObj.data.queryResults)?.length) {
-              searchObj.data.queryResults = response.content.results;
-            } else {
-              searchObj.data.queryResults.hits = response.content.results.hits;
-              searchObj.data.queryResults.total =
-                response.content.results.total;
-
-              searchObj.data.queryResults.took += response.content.results.took;
-              searchObj.data.queryResults.scan_size +=
-                response.content.results.scan_size;
+            searchObj.data.queryResults = {
+              ...response.content.results,
+              took: (searchObj.data?.queryResults?.took || 0) + response.content.results.took,
+              scan_size: (searchObj.data?.queryResults?.scan_size || 0) + response.content.results.scan_size,
             }
           } else if (isPagination) {
             searchObj.data.queryResults.hits = response.content.results.hits;
@@ -5434,8 +5478,9 @@ const useLogs = () => {
         addRequestId(payload.traceId);
       }
     } else if (searchObj.meta.sqlMode && isLimitQuery(parsedSQL)) {
-      resetHistogramWithError("Histogram is not available for limit queries.");
-    } else if (searchObj.meta.sqlMode && isDistinctQuery(parsedSQL)) {
+      resetHistogramWithError("Histogram unavailable for CTEs, DISTINCT and LIMIT queries.", -1);
+      searchObj.meta.histogramDirtyFlag = false;
+    } else if (searchObj.meta.sqlMode && (isDistinctQuery(parsedSQL) || isWithQuery(parsedSQL))) {
       let aggFlag = false;
       if (parsedSQL) {
         aggFlag = hasAggregation(parsedSQL?.columns);
@@ -5451,9 +5496,20 @@ const useLogs = () => {
           searchObjDebug["pagecountEndTime"] = performance.now();
         }, 0);
       }
-      resetHistogramWithError(
-        "Histogram is not available for DISTINCT queries.",
-      );
+      if(isWithQuery(parsedSQL)){
+        resetHistogramWithError(
+          "Histogram unavailable for CTEs, DISTINCT and LIMIT queries.",
+          -1
+        );
+        searchObj.meta.histogramDirtyFlag = false;
+      }
+      else{
+        resetHistogramWithError(
+          "Histogram unavailable for CTEs, DISTINCT and LIMIT queries.",
+          -1
+        );
+      }
+      searchObj.meta.histogramDirtyFlag = false;
     } else {
       let aggFlag = false;
       if (parsedSQL) {
@@ -5488,7 +5544,7 @@ const useLogs = () => {
   function isNonAggregatedSQLMode(searchObj: any, parsedSQL: any) {
     return !(
       searchObj.meta.sqlMode &&
-      (isLimitQuery(parsedSQL) || isDistinctQuery(parsedSQL))
+      (isLimitQuery(parsedSQL) || isDistinctQuery(parsedSQL) || isWithQuery(parsedSQL))
     );
   }
 
@@ -5542,8 +5598,8 @@ const useLogs = () => {
       processHistogramRequest(payload.queryReq);
     }
 
-    if (payload.type === "search") searchObj.loading = false;
-    if (payload.type === "histogram" || payload.type === "pageCount")
+    if (payload.type === "search" && !response?.content?.should_client_retry) searchObj.loading = false;
+    if ((payload.type === "histogram" || payload.type === "pageCount") && !response?.content?.should_client_retry)
       searchObj.loadingHistogram = false;
 
     searchObj.data.isOperationCancelled = false;
@@ -5854,6 +5910,8 @@ const useLogs = () => {
     routeToSearchSchedule,
     isActionsEnabled,
     sendCancelSearchMessage,
+    isDistinctQuery,
+    isWithQuery,
   };
 };
 

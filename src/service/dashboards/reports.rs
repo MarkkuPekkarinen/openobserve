@@ -28,6 +28,7 @@ use config::{
             ReportFrequencyType, ReportListFilters, ReportTimerangeType,
         },
     },
+    utils::time::now_micros,
 };
 use cron::Schedule;
 use futures::{StreamExt, future::try_join_all};
@@ -91,7 +92,9 @@ pub async fn save(
         report.frequency.cron =
             super::super::alerts::alert::update_cron_expression(&report.frequency.cron, now);
         // Check if the cron expression is valid
-        Schedule::from_str(&report.frequency.cron)?;
+        if let Err(e) = Schedule::from_str(&report.frequency.cron) {
+            return Err(anyhow::anyhow!("Invalid cron expression: {e}"));
+        }
     } else if report.frequency.interval == 0 {
         report.frequency.interval = 1;
     }
@@ -512,7 +515,7 @@ async fn generate_report(
             );
 
             let time_duration: i64 = time_duration.parse()?;
-            let end_time = chrono::Utc::now().timestamp_micros();
+            let end_time = now_micros();
             let start_time = match time_unit {
                 "m" => {
                     end_time

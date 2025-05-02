@@ -25,18 +25,21 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
       style="min-height: 90vh; overflow: hidden"
     >
       <template style="background-color: red" v-slot:before>
-        <div class="full-height">
-          <div class="sticky-header">
-            <h6 class="q-ma-none q-pa-sm">
+        <div class="full-height  q-pt-sm">
+          <div class="sticky-header q-px-sm">
+            <span class="q-ma-none q-pa-sm" style="font-size: 18px;">
               {{t("nodes.filter_header")}} <q-icon name="filter_list" />
-              <div class="float-right"><a class="cursor-pointer text-caption tw-underline" @click="clearAll()">{{t("nodes.clear_all")}}</a></div>
-            </h6>
-            <q-separator />
+              <div class="float-right"><a class="cursor-pointer text-caption tw-underline"
+                :class="filterApplied ? 'text-primary' : ''"
+                 @click="clearAll()">{{t("nodes.clear_all")}}</a></div>
+            </span>
           </div>
-          <div class="">
+          <q-separator class="q-mt-sm q-px-none q-mx-none" />
+
+          <div>
             <q-list>
               <q-expansion-item
-                v-if="regionRows.length > 0"
+                v-if="regionRows.length > 0 && store.state.zoConfig.super_cluster_enabled"
                 expand-separator
                 :label="t('nodes.region')"
                 class="text-subtitle1 nodes-filter-list"
@@ -105,7 +108,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               </q-expansion-item>
 
               <q-expansion-item
-                v-if="clusterRows.length > 0"
+                v-if="clusterRows.length > 0 && store.state.zoConfig.super_cluster_enabled"
                 expand-separator
                 :label="t('nodes.cluster')"
                 class="q-mt-sm text-subtitle1 nodes-filter-list"
@@ -270,7 +273,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                       :model-value="cpuUsage"
                       @change="val => { cpuUsage = val }"
                       :min="0"
-                      :max="100"
+                      :max="maxCPUUsage"
                       label-side
                       size="25px"
                       class="tw-w-[85%] q-mt-md q-ml-md"
@@ -296,7 +299,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                       :model-value="memoryUsage"
                       @change="val => { memoryUsage = val }"
                       :min="0"
-                      :max="100"
+                      :max="maxMemoryUsage"
                       label-side
                       size="25px"
                       class="tw-w-[85%] q-mt-md q-ml-md"
@@ -387,8 +390,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         <q-table
           ref="qTable"
           :rows="tabledata"
-          :columns="columns"
-          row-key="id"
+          :columns="computedColumns"
+          :row-key="(row: any) => 'node_data_row_key_' + row.name"
           :pagination="pagination"
           :filter="filterQuery"
           :filter-method="filterData"
@@ -398,22 +401,20 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         >
           <template #no-data><NoData /></template>
           <template #top="scope">
-            <div class="row full-width">
+            <div class="row full-width q-pt-sm flex items-center ">
               <div
                 class="col q-table__title items-start"
                 data-test="cipher-keys-list-title"
               >
                 {{ t("nodes.header") }}
               </div>
-              <div class="col-auto flex">
-                <q-btn :label="t('common.refresh')" class="text-bold text-capitalize q-mr-sm" 
-                color="secondary" style="height: 40px;" @click="getData(true)"></q-btn>
+              <div class="col-auto flex q-mb-sm ">
                 <q-input
                   v-model="filterQuery"
                   filled
                   dense
-                  class="q-ml-none q-mb-xs"
-                  style="width: 400px"
+                  class="q-ml-none q-mb-xs q-mr-md"
+                  style="width: 400px;"
                   :placeholder="t('nodes.search')"
                   clearable
                 >
@@ -421,8 +422,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     <q-icon name="search" />
                   </template>
                 </q-input>
+                <q-btn :label="t('common.refresh')" class="text-bold text-capitalize no-border"
+                color="secondary" style="height: 40px; width: 90px;" @click="getData(true)"></q-btn>
               </div>
-              <div class="col-auto flex q-ml-md pagination-align">
+
+            </div>
+            <div class="col-auto flex q-ml-auto pagination-align q-pb-sm">
                 <QTablePagination
                   v-if="resultTotal > 0"
                   :scope="scope"
@@ -432,20 +437,26 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                   @update:changeRecordPerPage="changePagination"
                 />
               </div>
-            </div>
+          </template>
+
+          <template v-slot:body-cell-id="props">
+            <q-td :props="props"
+             :class="`status-${props.row.status.toLowerCase()}`"
+            >
+            {{ props.row.id }}
+            </q-td>
           </template>
 
           <template v-slot:body-cell-name="props">
             <q-td
               :props="props"
-              :class="`status-${props.row.status.toLowerCase()}`"
             >
               {{ props.row.name.length > 40 ? props.row.name.substring(0, 40) + "..." : props.row.name }}
               <q-tooltip>{{props.row.name}}</q-tooltip>
             </q-td>
           </template>
 
-          <template v-slot:body-cell-region="props">
+          <template v-if="store.state.zoConfig.super_cluster_enabled" v-slot:body-cell-region="props">
             <q-td :props="props">
               <q-badge class="badge-region q-mr-xs">{{ props.row.region }}
                 <q-tooltip>{{t("nodes.region")}}</q-tooltip>
@@ -455,7 +466,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
               </q-badge>
             </q-td>
           </template>
-
           <template v-slot:body-cell-tcp="props">
             <q-td :props="props" class="tcp-cell">
               {{ props.row.tcp_conns }} (E:{{
@@ -511,7 +521,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 </template>
 
 <script lang="ts">
-import { defineComponent, ref, onMounted, onUpdated, watch, Ref } from "vue";
+import { defineComponent, ref, onMounted, onUpdated, watch, Ref, computed } from "vue";
 import { useStore } from "vuex";
 import { useRouter } from "vue-router";
 import { useQuasar, date, copyToClipboard, QTableProps } from "quasar";
@@ -520,6 +530,7 @@ import { useI18n } from "vue-i18n";
 import QTablePagination from "@/components/shared/grid/Pagination.vue";
 import NoData from "@/components/shared/grid/NoData.vue";
 import CommonService from "@/services/common";
+import useIsMetaOrg from "@/composables/useIsMetaOrg";
 
 export default defineComponent({
   name: "PageCipherKeys",
@@ -538,18 +549,26 @@ export default defineComponent({
     const loading = ref(false);
     const splitterModel = ref(250);
     const filterQuery = ref("");
-    const columns = ref<QTableProps["columns"]>([
-      {
-        name: "name",
-        field: "name",
-        label: t("nodes.name"),
-        align: "left",
-        sortable: true,
+    const computedColumns = computed(() => {
+      const columns =  [
+        {
+          name: "id",
+          field: "id",
+          label: "#",
+          align: "center",
+          sortable: false,
+        },
+        {
+          name: "name",
+          field: "name",
+          label: t("nodes.name"),
+          align: "left",
+          sortable: true,
       },
       {
         name: "region",
         field: "region",
-        label: "",
+        label: t("nodes.region"),
         align: "left",
         style: "width: 50px",
       },
@@ -585,7 +604,12 @@ export default defineComponent({
         sortable: false,
         style: "width: 150px;",
       },
-    ]);
+    ];
+      if(!store.state.zoConfig.super_cluster_enabled) {
+        columns.splice(2, 1);
+      }
+      return columns;
+    });
     const perPageOptions = [
       { label: "20", value: 20 },
       { label: "50", value: 50 },
@@ -635,6 +659,7 @@ export default defineComponent({
     const maxWaittime = ref(60);
     const maxCPUUsage = ref(100);
     const maxMemoryUsage = ref(100);
+    const { isMetaOrg } = useIsMetaOrg();
 
     const closewaitUsage = ref({
       min: 0,
@@ -661,48 +686,58 @@ export default defineComponent({
             statuses: new Set()
         };
 
+        const maxValues = {
+            tcpConnsEstablished: { value: 0 },
+            tcpConnsCloseWait: { value: 0 },
+            tcpConnsTimeWait: { value: 0 },
+            percentageMemoryUsage: { value: 0 },
+            cpuUsage: { value: 0 }
+        };
+        //gloabal index is used to assign the id to the node
+        //the global index should continue from the last id of the previous node and previous cluster
+        let globalIndex = 1;
+
         for (const region in data) {
             uniqueValues.regions.add(region);
+
             for (const cluster in data[region]) {
                 uniqueValues.clusters.add(cluster);
+
                 data[region][cluster].forEach((node: any) => {
-                    node.metrics["percentage_memory_usage"] = (node.metrics.memory_usage > 0) ? Math.round((node.metrics.memory_usage/node.metrics.memory_total) * 100) : 0;
-                    node.metrics["cpu_usage"] = Math.round(node.metrics["cpu_usage"])
-                    const { metrics, role, status, ...nodeData } = node;
-                    
+                    // Calculate memory usage percentage
+                    const percentageMemoryUsage = (node.metrics.memory_usage > 0)
+                        ? Math.round((node.metrics.memory_usage / node.metrics.memory_total) * 100)
+                        : 0;
+
+                    // Round CPU usage
+                    const cpuUsage = Math.round(node.metrics.cpu_usage);
+
                     // Extract unique node types from role array
-                    role.forEach((r: any) => uniqueValues.nodeTypes.add(r));
-                    
+                    node.role.forEach((r: any) => uniqueValues.nodeTypes.add(r));
+
                     // Extract unique statuses
-                    uniqueValues.statuses.add(status);
+                    uniqueValues.statuses.add(node.status);
 
-                    if(node.tcp_conns_established > maxEstablished.value) {
-                      maxEstablished.value = node.tcp_conns_established;
-                    }
+                    // Update max values
+                    maxValues.tcpConnsEstablished.value = Math.max(maxValues.tcpConnsEstablished.value, node.metrics.tcp_conns_established);
+                    maxValues.tcpConnsCloseWait.value = Math.max(maxValues.tcpConnsCloseWait.value, node.metrics.tcp_conns_close_wait);
+                    maxValues.tcpConnsTimeWait.value = Math.max(maxValues.tcpConnsTimeWait.value, node.metrics.tcp_conns_time_wait);
+                    maxValues.percentageMemoryUsage.value = Math.max(maxValues.percentageMemoryUsage.value, percentageMemoryUsage);
+                    maxValues.cpuUsage.value = Math.max(maxValues.cpuUsage.value, cpuUsage);
+                    //this is done because the id should be 2 digits to maintain consistency with other tables
+                    node.id = globalIndex < 10 ? `0${globalIndex}` : globalIndex;
+                    //increment the global index
+                    globalIndex++;
 
-                    if(node.tcp_conns_close_wait > maxClosewait.value) {
-                      maxClosewait.value = node.tcp_conns_close_wait;
-                    }
-
-                    if(node.tcp_conns_time_wait > maxWaittime.value) {
-                      maxWaittime.value = node.tcp_conns_time_wait;
-                    }
-
-                    if(node.percentage_memory_usage > maxMemoryUsage.value) {
-                      maxMemoryUsage.value = node.percentage_memory_usage;
-                    }
-
-                    if(node.cpu_usage > maxCPUUsage.value) {
-                      maxCPUUsage.value = node.cpu_usage;
-                    }
-                    
                     result.push({
                         region,
                         cluster,
-                        status,
-                        role,
-                        ...nodeData,
-                        ...metrics,
+                        status: node.status,
+                        role: node.role,
+                        ...node,
+                        ...node.metrics,
+                        percentage_memory_usage: percentageMemoryUsage,
+                        cpu_usage: cpuUsage
                     });
                 });
             }
@@ -715,9 +750,11 @@ export default defineComponent({
                 clusters: Array.from(uniqueValues.clusters),
                 nodeTypes: Array.from(uniqueValues.nodeTypes),
                 statuses: Array.from(uniqueValues.statuses)
-            }
+            },
+            maxValues
         };
     }
+
 
     const getData = (filterFlag: boolean = false) => {
       loading.value = true;
@@ -729,8 +766,7 @@ export default defineComponent({
       CommonService.list_nodes(store.state.selectedOrganization.identifier)
         .then((response) => {
           const responseData = response.data;
-          const { flattenedData, uniqueValues } = flattenObject(responseData);
-          
+          const { flattenedData, uniqueValues, maxValues } = flattenObject(responseData);          
           regionRows.value = uniqueValues.regions.map(name => ({ name }))
           clusterRows.value = uniqueValues.clusters.map(name => ({ name }))
           nodetypeRows.value = uniqueValues.nodeTypes.map(name => ({ name }))
@@ -739,6 +775,11 @@ export default defineComponent({
           originalData.value = flattenedData;
           resultTotal.value = flattenedData.length;
           loading.value = false;
+          maxCPUUsage.value = cpuUsage.value.max = maxValues.cpuUsage.value;
+          maxMemoryUsage.value = memoryUsage.value.max = maxValues.percentageMemoryUsage.value;
+          maxEstablished.value = establishedUsage.value.max = maxValues.tcpConnsEstablished.value;
+          maxClosewait.value = closewaitUsage.value.max = maxValues.tcpConnsCloseWait.value;
+          maxWaittime.value = waittimeUsage.value.max = maxValues.tcpConnsTimeWait.value;
           if(filterFlag) {
             applyFilter();
           }
@@ -758,9 +799,10 @@ export default defineComponent({
           }
         });
     };
-
-    getData(false);
-
+    //only call getData if the org is meta org otherwise we can ignore as the api is only allowed for meta org
+    if(isMetaOrg.value){
+      getData(false);
+    }
     const applyFilter = () => {
       let terms = filterQuery.value.toLowerCase();
       const data = originalData.value.filter((row: any) => {
@@ -774,7 +816,6 @@ export default defineComponent({
           const matchesEstablished = row.tcp_conns_established >= establishedUsage.value.min && row.tcp_conns_established <= establishedUsage.value.max;
           const matchesCloseWait = row.tcp_conns_close_wait >= closewaitUsage.value.min && row.tcp_conns_close_wait <= closewaitUsage.value.max;
           const matchesWaitTime = row.tcp_conns_time_wait >= waittimeUsage.value.min && row.tcp_conns_time_wait <= waittimeUsage.value.max;
-          
           return matchesSearch && matchesRegion && matchesCluster && matchesNodeType && matchesStatus && matchesCPU && matchesMemory && matchesEstablished && matchesCloseWait && matchesWaitTime;
       });
 
@@ -796,6 +837,9 @@ export default defineComponent({
       tabledata.value = originalData.value;
       resultTotal.value = originalData.value.length;
     }
+    const filterApplied = computed(()=>{
+      return selectedRegions.value.length > 0 || selectedClusters.value.length > 0 || selectedNodetypes.value.length > 0 || selectedStatuses.value.length > 0;
+    })
 
     return {
       t,
@@ -804,7 +848,7 @@ export default defineComponent({
       qTable,
       loading,
       tabledata,
-      columns,
+      computedColumns,
       splitterModel,
       getData,
       pagination,
@@ -824,11 +868,14 @@ export default defineComponent({
       selectedNodetypes,
       selectedStatuses,
       establishedToggle,
+      filterApplied,
       closewaitToggle,
       waittimeToggle,
       establishedUsage,
       closewaitUsage,
       waittimeUsage,
+      maxCPUUsage,
+      maxMemoryUsage,
       maxEstablished,
       maxClosewait,
       maxWaittime,
@@ -949,15 +996,15 @@ export default defineComponent({
 }
 
 .status-online {
-  border-left: 5px solid green !important;
+  border-left: #00A76F 5px solid  !important;
 }
 
 .status-offline {
-  border-left: 5px solid red;
+  border-left: 5px solid #CE2528 !important;
 }
 
 .status-prepare {
-  border-left: 5px solid warning;
+  border-left: 5px solid #FFAB00  !important;
 }
 
 .node-list-filter-table {
@@ -983,6 +1030,9 @@ export default defineComponent({
 }
 
 .nodes-filter-list .q-item__label {
-  font-weight: 600 !important;
+  font-weight: 500 !important;
+}
+.text-subtitle1 {
+  font-size: 14px !important;
 }
 </style>

@@ -32,6 +32,7 @@ mod alert_manager;
 mod cipher;
 mod compactor;
 mod file_downloader;
+mod file_list_dump;
 pub(crate) mod files;
 mod flatten_compactor;
 pub mod metrics;
@@ -42,7 +43,8 @@ mod stats;
 pub(crate) mod syslog_server;
 mod telemetry;
 
-pub use file_downloader::queue_background_download;
+pub use file_downloader::queue_download;
+pub use file_list_dump::FILE_LIST_SCHEMA;
 pub use mmdb_downloader::MMDB_INIT_NOTIFIER;
 
 pub async fn init() -> Result<(), anyhow::Error> {
@@ -71,6 +73,11 @@ pub async fn init() -> Result<(), anyhow::Error> {
                 first_name: "root".to_owned(),
                 last_name: "".to_owned(),
                 is_external: false,
+                token: if cfg.auth.root_user_token.is_empty() {
+                    None
+                } else {
+                    Some(cfg.auth.root_user_token.clone())
+                },
             },
         )
         .await;
@@ -94,6 +101,18 @@ pub async fn init() -> Result<(), anyhow::Error> {
     // Auth auditing should be done by router also
     #[cfg(feature = "enterprise")]
     tokio::task::spawn(async move { self_reporting::run_audit_publish().await });
+    #[cfg(feature = "enterprise")]
+    {
+        tokio::task::spawn(async move { db::ofga::watch().await });
+        db::ofga::cache().await.expect("ofga model cache failed");
+        o2_openfga::authorizer::authz::init_open_fga().await;
+        // RBAC model
+        if get_openfga_config().enabled {
+            if let Err(e) = crate::common::infra::ofga::init().await {
+                log::error!("OFGA init failed: {}", e);
+            }
+        }
+    }
 
     tokio::task::spawn(async move { promql_self_consume::run().await });
     // Router doesn't need to initialize job
@@ -126,8 +145,6 @@ pub async fn init() -> Result<(), anyhow::Error> {
     tokio::task::spawn(async move { db::dashboards::reports::watch().await });
     tokio::task::spawn(async move { db::organization::watch().await });
     tokio::task::spawn(async move { db::pipeline::watch().await });
-    #[cfg(feature = "enterprise")]
-    tokio::task::spawn(async move { db::ofga::watch().await });
 
     #[cfg(feature = "enterprise")]
     if LOCAL_NODE.is_ingester() || LOCAL_NODE.is_querier() {
@@ -176,9 +193,6 @@ pub async fn init() -> Result<(), anyhow::Error> {
     infra_file_list::LOCAL_CACHE.create_table_index().await?;
 
     #[cfg(feature = "enterprise")]
-    db::ofga::cache().await.expect("ofga model cache failed");
-
-    #[cfg(feature = "enterprise")]
     if !LOCAL_NODE.is_compactor() {
         db::session::cache()
             .await
@@ -202,6 +216,10 @@ pub async fn init() -> Result<(), anyhow::Error> {
     tokio::task::spawn(async move { alert_manager::run().await });
     tokio::task::spawn(async move { file_downloader::run().await });
 
+    if LOCAL_NODE.is_compactor() {
+        tokio::task::spawn(async move { file_list_dump::run().await });
+    }
+
     // load metrics disk cache
     tokio::task::spawn(async move { crate::service::promql::search::init().await });
     // start pipeline data retention
@@ -211,20 +229,9 @@ pub async fn init() -> Result<(), anyhow::Error> {
     );
 
     #[cfg(feature = "enterprise")]
-    o2_openfga::authorizer::authz::init_open_fga().await;
-
-    #[cfg(feature = "enterprise")]
     tokio::task::spawn(async move { cipher::run().await });
     #[cfg(feature = "enterprise")]
     tokio::task::spawn(async move { db::keys::watch().await });
-
-    // RBAC model
-    #[cfg(feature = "enterprise")]
-    if get_openfga_config().enabled {
-        if let Err(e) = crate::common::infra::ofga::init().await {
-            log::error!("OFGA init failed: {}", e);
-        }
-    }
 
     // Shouldn't serve request until initialization finishes
     log::info!("Job initialization complete");

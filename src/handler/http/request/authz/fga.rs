@@ -18,9 +18,30 @@ use actix_web::{HttpRequest, HttpResponse, delete, get, post, put, web};
 #[cfg(feature = "enterprise")]
 use o2_dex::meta::auth::RoleRequest;
 
+#[cfg(feature = "enterprise")]
+use crate::common::meta::http::HttpResponse as MetaHttpResponse;
 use crate::common::meta::user::{UserGroup, UserGroupRequest, UserRoleRequest};
 
 #[cfg(feature = "enterprise")]
+/// CreateRoles
+///
+/// #{"ratelimit_module":"Roles", "ratelimit_module_operation":"create"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "CreateRoles",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    request_body(content = UserRoleRequest, description = "UserRoleRequest", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[post("/{org_id}/roles")]
 pub async fn create_role(
     org_id: web::Path<String>,
@@ -30,12 +51,30 @@ pub async fn create_role(
     let user_req = user_req.into_inner();
 
     match o2_openfga::authorizer::roles::create_role(&user_req.name, &org_id).await {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
+        Ok(_) => Ok(MetaHttpResponse::ok(
+            serde_json::json!({"successful": "true"}),
+        )),
         Err(err) => Ok(HttpResponse::InternalServerError().body(err.to_string())),
     }
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "CreateRoles",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    request_body(content = UserRoleRequest, description = "UserRoleRequest", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[post("/{org_id}/roles")]
 pub async fn create_role(
     _org_id: web::Path<String>,
@@ -45,23 +84,78 @@ pub async fn create_role(
 }
 
 #[cfg(feature = "enterprise")]
+/// DeleteRole
+///
+/// #{"ratelimit_module":"Roles", "ratelimit_module_operation":"delete"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "DeleteRole",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[delete("/{org_id}/roles/{role_id}")]
 pub async fn delete_role(path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     let (org_id, role_name) = path.into_inner();
 
     match o2_openfga::authorizer::roles::delete_role(&org_id, &role_name).await {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
+        Ok(_) => Ok(MetaHttpResponse::ok(
+            serde_json::json!({"successful": "true"}),
+        )),
         Err(err) => Ok(HttpResponse::InternalServerError().body(err.to_string())),
     }
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "DeleteRole",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[delete("/{org_id}/roles/{role_id}")]
 pub async fn delete_role(_path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Forbidden().json("Not Supported"))
 }
 
 #[cfg(feature = "enterprise")]
+/// ListRoles
+///
+/// #{"ratelimit_module":"Roles", "ratelimit_module_operation":"list"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "ListRoles",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<String>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/roles")]
 pub async fn get_roles(org_id: web::Path<String>, req: HttpRequest) -> Result<HttpResponse, Error> {
     let org_id = org_id.into_inner();
@@ -109,6 +203,21 @@ pub async fn get_roles(org_id: web::Path<String>, req: HttpRequest) -> Result<Ht
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "ListRoles",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<String>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/roles")]
 pub async fn get_roles(
     _org_id: web::Path<String>,
@@ -118,6 +227,26 @@ pub async fn get_roles(
 }
 
 #[cfg(feature = "enterprise")]
+/// UpdateRoles
+///
+/// #{"ratelimit_module":"Roles", "ratelimit_module_operation":"update"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "UpdateRoles",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+    ),
+    request_body(content = RoleRequest, description = "RoleRequest", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[put("/{org_id}/roles/{role_id}")]
 pub async fn update_role(
     path: web::Path<(String, String)>,
@@ -142,6 +271,23 @@ pub async fn update_role(
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "UpdateRoles",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+    ),
+    request_body(content = RoleRequest, description = "RoleRequest", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[post("/{org_id}/roles/{role_id}")]
 pub async fn update_role(
     _path: web::Path<(String, String)>,
@@ -151,6 +297,26 @@ pub async fn update_role(
 }
 
 #[cfg(feature = "enterprise")]
+/// GetResourcePermission
+///
+/// #{"ratelimit_module":"Roles", "ratelimit_module_operation":"get"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "GetResourcePermission",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+        ("resource" = String, Path, description = "resource"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<O2EntityAuthorization>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/roles/{role_id}/permissions/{resource}")]
 pub async fn get_role_permissions(
     path: web::Path<(String, String, String)>,
@@ -163,14 +329,50 @@ pub async fn get_role_permissions(
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "GetResourcePermission",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+        ("resource" = String, Path, description = "resource"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<O2EntityAuthorization>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/roles/{role_id}/permissions/{resource}")]
 pub async fn get_role_permissions(
-    _path: web::Path<(String, String)>,
+    _path: web::Path<(String, String, String)>,
 ) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Forbidden().json("Not Supported"))
 }
 
 #[cfg(feature = "enterprise")]
+/// GetRoleUsers
+///
+/// #{"ratelimit_module":"Roles", "ratelimit_module_operation":"list"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "GetRoleUsers",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<String>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/roles/{role_id}/users")]
 pub async fn get_users_with_role(path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     let (org_id, role_id) = path.into_inner();
@@ -181,12 +383,47 @@ pub async fn get_users_with_role(path: web::Path<(String, String)>) -> Result<Ht
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Roles",
+    operation_id = "GetRoLesUsers",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("role_id" = String, Path, description = "Role Id"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<String>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/roles/{role_id}/users")]
 pub async fn get_users_with_role(_org_id: web::Path<String>) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Forbidden().json("Not Supported"))
 }
 
 #[cfg(feature = "enterprise")]
+/// CreateGroup
+///
+/// #{"ratelimit_module":"Groups", "ratelimit_module_operation":"create"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "CreateGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    request_body(content = UserGroup, description = "UserGroup", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[post("/{org_id}/groups")]
 pub async fn create_group(
     org_id: web::Path<String>,
@@ -202,12 +439,30 @@ pub async fn create_group(
     )
     .await
     {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
+        Ok(_) => Ok(MetaHttpResponse::ok(
+            serde_json::json!({"successful": "true"}),
+        )),
         Err(err) => Ok(HttpResponse::InternalServerError().body(err.to_string())),
     }
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "CreateGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    request_body(content = UserGroup, description = "UserGroup", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[post("/{org_id}/groups")]
 pub async fn create_group(
     _org_id: web::Path<String>,
@@ -217,6 +472,26 @@ pub async fn create_group(
 }
 
 #[cfg(feature = "enterprise")]
+/// UpdateGroup
+///
+/// #{"ratelimit_module":"Groups", "ratelimit_module_operation":"update"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "UpdateGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("group_name" = String, Path, description = "Group name"),
+    ),
+    request_body(content = UserGroupRequest, description = "UserGroupRequest", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[put("/{org_id}/groups/{group_name}")]
 pub async fn update_group(
     path: web::Path<(String, String)>,
@@ -235,12 +510,31 @@ pub async fn update_group(
     )
     .await
     {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
+        Ok(_) => Ok(MetaHttpResponse::ok(
+            serde_json::json!({"successful": "true"}),
+        )),
         Err(err) => Ok(HttpResponse::InternalServerError().body(err.to_string())),
     }
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "UpdateGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("group_name" = String, Path, description = "Group name"),
+    ),
+    request_body(content = UserGroupRequest, description = "UserGroupRequest", content_type = "application/json"),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[put("/{org_id}/groups/{group_name}")]
 pub async fn update_group(
     _org_id: web::Path<String>,
@@ -250,6 +544,24 @@ pub async fn update_group(
 }
 
 #[cfg(feature = "enterprise")]
+/// ListGroups
+///
+/// #{"ratelimit_module":"Groups", "ratelimit_module_operation":"list"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "ListGroups",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<String>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/groups")]
 pub async fn get_groups(path: web::Path<String>, req: HttpRequest) -> Result<HttpResponse, Error> {
     let org_id = path.into_inner();
@@ -298,12 +610,45 @@ pub async fn get_groups(path: web::Path<String>, req: HttpRequest) -> Result<Htt
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "ListGroups",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = Vec<String>),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/groups")]
 pub async fn get_groups(_path: web::Path<String>) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Forbidden().json("Not Supported"))
 }
 
 #[cfg(feature = "enterprise")]
+/// GetGroup
+///
+/// #{"ratelimit_module":"Groups", "ratelimit_module_operation":"get"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "GetGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = UserGroup),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/groups/{group_name}")]
 pub async fn get_group_details(path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     let (org_id, group_name) = path.into_inner();
@@ -315,6 +660,21 @@ pub async fn get_group_details(path: web::Path<(String, String)>) -> Result<Http
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "GetGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = UserGroup),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[get("/{org_id}/groups/{group_name}")]
 pub async fn get_group_details(_path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Forbidden().json("Not Supported"))
@@ -337,17 +697,54 @@ pub async fn get_resources(_org_id: web::Path<String>) -> Result<HttpResponse, E
 }
 
 #[cfg(feature = "enterprise")]
+/// DeleteGroup
+///
+/// #{"ratelimit_module":"Groups", "ratelimit_module_operation":"delete"}#
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "DeleteGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("group_name" = String, Path, description = "Group name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[delete("/{org_id}/groups/{group_name}")]
 pub async fn delete_group(path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     let (org_id, group_name) = path.into_inner();
 
     match o2_openfga::authorizer::groups::delete_group(&org_id, &group_name).await {
-        Ok(_) => Ok(HttpResponse::Ok().finish()),
+        Ok(_) => Ok(MetaHttpResponse::ok(
+            serde_json::json!({"successful": "true"}),
+        )),
         Err(err) => Ok(HttpResponse::InternalServerError().body(err.to_string())),
     }
 }
 
 #[cfg(not(feature = "enterprise"))]
+#[utoipa::path(
+    context_path = "/api",
+    tag = "Groups",
+    operation_id = "DeleteGroup",
+    security(
+        ("Authorization"= [])
+    ),
+    params(
+        ("org_id" = String, Path, description = "Organization name"),
+        ("group_name" = String, Path, description = "Group name"),
+    ),
+    responses(
+        (status = 200, description = "Success", content_type = "application/json", body = HttpResponse),
+        (status = 500, description = "Failure", content_type = "application/json", body = HttpResponse),
+    )
+)]
 #[delete("/{org_id}/groups/{group_name}")]
 pub async fn delete_group(_path: web::Path<(String, String)>) -> Result<HttpResponse, Error> {
     Ok(HttpResponse::Forbidden().json("Not Supported"))

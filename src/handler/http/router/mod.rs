@@ -36,19 +36,25 @@ use {
     actix_http::h1::Payload,
     actix_web::{HttpMessage, web::BytesMut},
     base64::{Engine as _, engine::general_purpose},
+    config::utils::time::now_micros,
     futures::StreamExt,
     o2_enterprise::enterprise::common::{
-        auditor::{AuditMessage, HttpMeta, Protocol},
+        auditor::{AuditMessage, Protocol, ResponseMeta},
         infra::config::get_config as get_o2_config,
     },
 };
 
 use super::request::*;
-use crate::common::meta::{middleware_data::RumExtraData, proxy::PathParamProxyURL};
+use crate::{
+    common::meta::{middleware_data::RumExtraData, proxy::PathParamProxyURL},
+    handler::http::request::search::search_inspector,
+};
 
 pub mod middlewares;
 pub mod openapi;
 pub mod ui;
+
+pub const ERROR_HEADER: &str = "X-Error-Message";
 
 pub fn get_cors() -> Rc<Cors> {
     let cors = Cors::default()
@@ -110,7 +116,7 @@ async fn audit_middleware(
         req.set_payload(payload.into());
 
         // Call the next service in the chain
-        let res = next.call(req).await?;
+        let mut res = next.call(req).await?;
 
         if res.response().error().is_none() {
             let body = if path.ends_with("/settings/logo") {
@@ -119,23 +125,38 @@ async fn audit_middleware(
             } else {
                 String::from_utf8(request_body.to_vec()).unwrap_or_default()
             };
+            let error_header = res.response().headers().get(ERROR_HEADER);
+            let error_msg = error_header
+                .map(|error_header| error_header.to_str().unwrap_or_default().to_string());
+            // Remove the error header from the response
+            // We can't read the response body at this point, hence need to rely
+            // on the error header to get the error message. Since, this is not required
+            // in the response to the client, we can safely remove it.
+            res.headers_mut().remove(ERROR_HEADER);
+
             audit(AuditMessage {
                 user_email,
                 org_id,
-                _timestamp: chrono::Utc::now().timestamp_micros(),
-                protocol: Protocol::Http(HttpMeta {
-                    method,
-                    path,
-                    body,
-                    query_params,
-                    response_code: res.response().status().as_u16(),
-                }),
+                _timestamp: now_micros(),
+                protocol: Protocol::Http,
+                response_meta: ResponseMeta {
+                    http_method: method,
+                    http_path: path,
+                    http_body: body,
+                    http_query_params: query_params,
+                    http_response_code: res.response().status().as_u16(),
+                    error_msg,
+                    trace_id: None,
+                },
             })
             .await;
         }
         Ok(res)
     } else {
-        next.call(req).await
+        // Remove the error header from the response if it exists
+        let mut res = next.call(req).await?;
+        res.headers_mut().remove(ERROR_HEADER);
+        Ok(res)
     }
 }
 
@@ -144,7 +165,9 @@ async fn audit_middleware(
     req: ServiceRequest,
     next: Next<impl MessageBody>,
 ) -> Result<ServiceResponse<impl MessageBody>, actix_web::Error> {
-    next.call(req).await
+    let mut res = next.call(req).await?;
+    res.headers_mut().remove(ERROR_HEADER);
+    Ok(res)
 }
 
 #[get("/metrics")]
@@ -361,6 +384,7 @@ pub fn get_service_routes(svc: &mut web::ServiceConfig) {
         .service(organization::org::get_user_rumtoken)
         .service(organization::org::update_user_rumtoken)
         .service(organization::org::node_list)
+        .service(organization::org::cluster_info)
         .service(organization::es::org_index)
         .service(organization::es::org_license)
         .service(organization::es::org_xpack)
@@ -406,6 +430,7 @@ pub fn get_service_routes(svc: &mut web::ServiceConfig) {
         .service(search::search_partition)
         .service(search::around_v1)
         .service(search::around_v2)
+        .service(search_inspector::get_search_profile)
         .service(search::values)
         .service(search::search_history)
         .service(search::saved_view::create_view)
@@ -527,8 +552,7 @@ pub fn get_service_routes(svc: &mut web::ServiceConfig) {
         .service(service_accounts::delete)
         .service(service_accounts::update)
         .service(service_accounts::get_api_token)
-        .service(websocket::websocket)
-        .service(ws_v2::websocket);
+        .service(ws::websocket);
 
     #[cfg(feature = "enterprise")]
     let service = service
@@ -553,6 +577,10 @@ pub fn get_service_routes(svc: &mut web::ServiceConfig) {
         .service(actions::action::update_action_details)
         .service(actions::action::serve_action_zip)
         .service(actions::action::delete_action)
+        .service(ratelimit::list_module_ratelimit)
+        .service(ratelimit::list_role_ratelimit)
+        .service(ratelimit::update_ratelimit)
+        .service(ratelimit::api_modules)
         .service(actions::operations::test_action);
 
     svc.service(service);

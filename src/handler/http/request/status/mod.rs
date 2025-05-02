@@ -28,7 +28,7 @@ use config::{
     cluster::LOCAL_NODE,
     get_config, get_instance_id,
     meta::{cluster::NodeStatus, function::ZoFunction},
-    utils::{json, schema_ext::SchemaExt},
+    utils::{base64, json, schema_ext::SchemaExt},
 };
 use hashbrown::HashMap;
 use infra::{
@@ -46,13 +46,13 @@ use {
         validator::{ID_TOKEN_HEADER, PKCE_STATE_ORG, get_user_email_from_auth_str},
     },
     crate::service::self_reporting::audit,
-    config::{ider, utils::base64},
+    config::{ider, utils::time::now_micros},
     o2_dex::{
         config::{get_config as get_dex_config, refresh_config as refresh_dex_config},
         service::auth::{exchange_code, get_dex_jwks, get_dex_login, refresh_token},
     },
     o2_enterprise::enterprise::common::{
-        auditor::{AuditMessage, HttpMeta, Protocol},
+        auditor::{AuditMessage, Protocol, ResponseMeta},
         infra::config::{get_config as get_o2_config, refresh_config as refresh_o2_config},
         settings::{get_logo, get_logo_text},
     },
@@ -127,6 +127,7 @@ struct ConfigResponse<'a> {
     query_default_limit: i64,
     max_dashboard_series: usize,
     actions_enabled: bool,
+    histogram_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -318,6 +319,7 @@ pub async fn zo_config() -> Result<HttpResponse, Error> {
         query_default_limit: cfg.limit.query_default_limit,
         max_dashboard_series: cfg.limit.max_dashboard_series,
         actions_enabled,
+        histogram_enabled: cfg.limit.histogram_enabled,
     }))
 }
 
@@ -410,14 +412,17 @@ pub async fn config_reload() -> Result<HttpResponse, Error> {
         // Since this is not a protected route, there is no way to get the user email
         user_email: "".to_string(),
         org_id: "".to_string(),
-        _timestamp: chrono::Utc::now().timestamp_micros(),
-        protocol: Protocol::Http(HttpMeta {
-            method: "GET".to_string(),
-            path: "/config/reload".to_string(),
-            query_params: "".to_string(),
-            body: "".to_string(),
-            response_code: 200,
-        }),
+        _timestamp: now_micros(),
+        protocol: Protocol::Http,
+        response_meta: ResponseMeta {
+            http_method: "GET".to_string(),
+            http_path: "/config/reload".to_string(),
+            http_query_params: "".to_string(),
+            http_body: "".to_string(),
+            http_response_code: 200,
+            error_msg: None,
+            trace_id: None,
+        },
     })
     .await;
     Ok(HttpResponse::Ok().json(serde_json::json!({"status": status})))
@@ -464,14 +469,17 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
     let mut audit_message = AuditMessage {
         user_email: "".to_string(),
         org_id: "".to_string(),
-        _timestamp: chrono::Utc::now().timestamp_micros(),
-        protocol: Protocol::Http(HttpMeta {
-            method: "GET".to_string(),
-            path: "/config/redirect".to_string(),
-            body: "".to_string(),
-            query_params: req.query_string().to_string(),
-            response_code: 302,
-        }),
+        _timestamp: now_micros(),
+        protocol: Protocol::Http,
+        response_meta: ResponseMeta {
+            http_method: "GET".to_string(),
+            http_path: "/config/redirect".to_string(),
+            http_body: "".to_string(),
+            http_query_params: req.query_string().to_string(),
+            http_response_code: 302,
+            error_msg: None,
+            trace_id: None,
+        },
     };
 
     match query.get("state") {
@@ -481,9 +489,7 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
             }
             Err(_) => {
                 // Bad Request
-                if let Protocol::Http(ref mut http_meta) = audit_message.protocol {
-                    http_meta.response_code = 400;
-                }
+                audit_message.response_meta.http_response_code = 400;
                 audit(audit_message).await;
                 return Err(Error::new(ErrorKind::Other, "invalid state in request"));
             }
@@ -491,9 +497,7 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
 
         None => {
             // Bad Request
-            if let Protocol::Http(ref mut http_meta) = audit_message.protocol {
-                http_meta.response_code = 400;
-            }
+            audit_message.response_meta.http_response_code = 400;
             audit(audit_message).await;
             return Err(Error::new(ErrorKind::Other, "no state in request"));
         }
@@ -547,10 +551,8 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
                     process_token(res).await
                 }
                 Err(e) => {
-                    if let Protocol::Http(ref mut http_meta) = audit_message.protocol {
-                        http_meta.response_code = 400;
-                    }
-                    audit_message._timestamp = chrono::Utc::now().timestamp_micros();
+                    audit_message.response_meta.http_response_code = 400;
+                    audit_message._timestamp = now_micros();
                     audit(audit_message).await;
                     return Ok(HttpResponse::Unauthorized().json(e.to_string()));
                 }
@@ -570,6 +572,7 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
             })
             .unwrap();
             let cfg = get_config();
+            let tokens = base64::encode(&tokens);
             let mut auth_cookie = Cookie::new("auth_tokens", tokens);
             auth_cookie.set_expires(
                 cookie::time::OffsetDateTime::now_utc()
@@ -585,7 +588,7 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
             }
             log::info!("Redirecting user after processing token");
 
-            audit_message._timestamp = chrono::Utc::now().timestamp_micros();
+            audit_message._timestamp = now_micros();
             audit(audit_message).await;
             Ok(HttpResponse::Found()
                 .append_header((header::LOCATION, login_url))
@@ -593,10 +596,8 @@ pub async fn redirect(req: HttpRequest) -> Result<HttpResponse, Error> {
                 .finish())
         }
         Err(e) => {
-            if let Protocol::Http(ref mut http_meta) = audit_message.protocol {
-                http_meta.response_code = 400;
-            }
-            audit_message._timestamp = chrono::Utc::now().timestamp_micros();
+            audit_message.response_meta.http_response_code = 400;
+            audit_message._timestamp = now_micros();
             audit(audit_message).await;
             Ok(HttpResponse::Unauthorized().json(e.to_string()))
         }
@@ -651,6 +652,7 @@ async fn refresh_token_with_dex(req: actix_web::HttpRequest) -> HttpResponse {
             })
             .unwrap();
             let conf = get_config();
+            let tokens = base64::encode(&tokens);
             let mut auth_cookie = Cookie::new("auth_tokens", tokens);
             auth_cookie.set_expires(
                 cookie::time::OffsetDateTime::now_utc()
@@ -670,6 +672,7 @@ async fn refresh_token_with_dex(req: actix_web::HttpRequest) -> HttpResponse {
         Err(_) => {
             let conf = get_config();
             let tokens = json::to_string(&AuthTokens::default()).unwrap();
+            let tokens = base64::encode(&tokens);
             let mut auth_cookie = Cookie::new("auth_tokens", tokens);
             auth_cookie.set_expires(
                 cookie::time::OffsetDateTime::now_utc()
@@ -698,6 +701,7 @@ fn prepare_empty_cookie<'a, T: Serialize + ?Sized>(
     conf: &Arc<Config>,
 ) -> Cookie<'a> {
     let tokens = json::to_string(token_struct).unwrap();
+    let tokens = base64::encode(&tokens);
     let mut auth_cookie = Cookie::new(cookie_name, tokens);
     auth_cookie.set_expires(
         cookie::time::OffsetDateTime::now_utc()
@@ -726,7 +730,9 @@ async fn logout(req: actix_web::HttpRequest) -> HttpResponse {
     let user_email = get_user_email_from_auth_str(&auth_str).await;
 
     if let Some(cookie) = req.cookie("auth_tokens") {
-        let auth_tokens: AuthTokens = json::from_str(cookie.value()).unwrap_or_default();
+        let val = config::utils::base64::decode_raw(cookie.value()).unwrap_or_default();
+        let auth_tokens: AuthTokens =
+            json::from_str(std::str::from_utf8(&val).unwrap_or_default()).unwrap_or_default();
         let access_token = auth_tokens.access_token;
 
         if access_token.starts_with("session") {
@@ -742,14 +748,17 @@ async fn logout(req: actix_web::HttpRequest) -> HttpResponse {
         audit(AuditMessage {
             user_email,
             org_id: "".to_string(),
-            _timestamp: chrono::Utc::now().timestamp_micros(),
-            protocol: Protocol::Http(HttpMeta {
-                method: "GET".to_string(),
-                path: "/config/logout".to_string(),
-                query_params: req.query_string().to_string(),
-                body: "".to_string(),
-                response_code: 200,
-            }),
+            _timestamp: now_micros(),
+            protocol: Protocol::Http,
+            response_meta: ResponseMeta {
+                http_method: "GET".to_string(),
+                http_path: "/config/logout".to_string(),
+                http_query_params: req.query_string().to_string(),
+                http_body: "".to_string(),
+                http_response_code: 200,
+                error_msg: None,
+                trace_id: None,
+            },
         })
         .await;
     }

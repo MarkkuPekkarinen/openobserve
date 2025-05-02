@@ -29,7 +29,7 @@ use config::{
         stream::{PartitionTimeLevel, StreamParams, StreamPartition, StreamType},
     },
     metrics,
-    utils::{flatten, json, schema_ext::SchemaExt},
+    utils::{flatten, json, schema_ext::SchemaExt, time::now_micros},
 };
 use hashbrown::HashSet;
 use infra::schema::{SchemaCache, unwrap_partition_time_level};
@@ -43,10 +43,6 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use serde_json::Map;
 
-use super::{
-    logs::O2IngestJsonData, metadata::distinct_values::DISTINCT_STREAM_PREFIX,
-    pipeline::batch_execution::ExecutablePipelineTraceInputs,
-};
 use crate::{
     common::meta::{
         http::HttpResponse as MetaHttpResponse,
@@ -56,11 +52,17 @@ use crate::{
     service::{
         alerts::alert::AlertExt,
         db, format_stream_name,
-        ingestion::{TriggerAlertData, evaluate_trigger, grpc::get_val, write_file},
+        ingestion::{
+            SERVICE, SERVICE_NAME, TriggerAlertData, evaluate_trigger, grpc::get_val, write_file,
+        },
+        logs::O2IngestJsonData,
         metadata::{
-            MetadataItem, MetadataType, distinct_values::DvItem, trace_list_index::TraceListItem,
+            MetadataItem, MetadataType,
+            distinct_values::{DISTINCT_STREAM_PREFIX, DvItem},
+            trace_list_index::TraceListItem,
             write,
         },
+        pipeline::batch_execution::ExecutablePipelineTraceInputs,
         schema::{check_for_schema, stream_schema_exists},
         self_reporting::report_request_usage_stats,
     },
@@ -69,8 +71,6 @@ use crate::{
 const PARENT_SPAN_ID: &str = "reference.parent_span_id";
 const PARENT_TRACE_ID: &str = "reference.parent_trace_id";
 const REF_TYPE: &str = "reference.ref_type";
-const SERVICE_NAME: &str = "service.name";
-const SERVICE: &str = "service";
 const BLOCK_FIELDS: [&str; 4] = ["_timestamp", "duration", "start_time", "end_time"];
 // ref https://opentelemetry.io/docs/specs/otel/trace/api/#retrieving-the-traceid-and-spanid
 const SPAN_ID_BYTES_COUNT: usize = 8;
@@ -190,10 +190,10 @@ pub async fn handle_otlp_request(
         Some(name) => format_stream_name(name),
         None => "default".to_owned(),
     };
-    let min_ts = (Utc::now()
-        - Duration::try_hours(cfg.limit.ingest_allowed_upto)
-            .expect("configuration error: too large ingest_allowed_upto"))
-    .timestamp_micros();
+    let min_ts = (Utc::now() - Duration::try_hours(cfg.limit.ingest_allowed_upto).unwrap())
+        .timestamp_micros();
+    let max_ts = (Utc::now() + Duration::try_hours(cfg.limit.ingest_allowed_in_future).unwrap())
+        .timestamp_micros();
 
     // Start retrieving associated pipeline and construct pipeline params
     let executable_pipeline = crate::service::ingestion::get_stream_executable_pipeline(
@@ -218,11 +218,11 @@ pub async fn handle_otlp_request(
                     let loc_service_name = get_val(&res_attr.value.as_ref());
                     if let Some(name) = loc_service_name.as_str() {
                         service_name = name.to_string();
-                        service_att_map.insert(res_attr.key, loc_service_name);
+                        service_att_map.insert(SERVICE_NAME.to_string(), loc_service_name);
                     }
                 } else {
                     service_att_map.insert(
-                        format!("{}.{}", SERVICE, res_attr.key),
+                        format!("{}_{}", SERVICE, res_attr.key),
                         get_val(&res_attr.value.as_ref()),
                     );
                 }
@@ -338,7 +338,14 @@ pub async fn handle_otlp_request(
                     partial_success.rejected_spans += 1;
                     continue;
                 }
-
+                if timestamp > max_ts {
+                    log::error!(
+                        "[TRACES:OTLP] skipping span with timestamp newer than allowed retention period, trace_id: {}",
+                        trace_id
+                    );
+                    partial_success.rejected_spans += 1;
+                    continue;
+                }
                 let local_val = Span {
                     trace_id: trace_id.clone(),
                     span_id,
@@ -601,10 +608,10 @@ pub async fn ingest_json(
     }
 
     let cfg = get_config();
-    let min_ts = (Utc::now()
-        - Duration::try_hours(cfg.limit.ingest_allowed_upto)
-            .expect("configuration error: too large ingest_allowed_upto"))
-    .timestamp_micros();
+    let min_ts = (Utc::now() - Duration::try_hours(cfg.limit.ingest_allowed_upto).unwrap())
+        .timestamp_micros();
+    let max_ts = (Utc::now() + Duration::try_hours(cfg.limit.ingest_allowed_in_future).unwrap())
+        .timestamp_micros();
 
     let json_values: Vec<json::Value> = json::from_slice(&body)?;
     let mut json_data_by_stream = HashMap::new();
@@ -620,6 +627,14 @@ pub async fn ingest_json(
         if timestamp < min_ts {
             log::error!(
                 "[TRACES:JSON] skipping span with timestamp older than allowed retention period, trace_id: {}",
+                &trace_id
+            );
+            partial_success.rejected_spans += 1;
+            continue;
+        }
+        if timestamp > max_ts {
+            log::error!(
+                "[TRACES:JSON] skipping span with timestamp newer than allowed retention period, trace_id: {}",
                 &trace_id
             );
             partial_success.rejected_spans += 1;
@@ -890,7 +905,7 @@ async fn write_traces(
         // Start check for alert trigger
         if let Some(alerts) = cur_stream_alerts {
             if triggers.len() < alerts.len() {
-                let alert_end_time = chrono::Utc::now().timestamp_micros();
+                let alert_end_time = now_micros();
                 for alert in alerts {
                     let key = format!(
                         "{}/{}/{}/{}",
@@ -904,7 +919,7 @@ async fn write_traces(
                         continue;
                     }
                     match alert
-                        .evaluate(Some(&record_val), (None, alert_end_time))
+                        .evaluate(Some(&record_val), (None, alert_end_time), None)
                         .await
                     {
                         Ok(res) if res.data.is_some() => {

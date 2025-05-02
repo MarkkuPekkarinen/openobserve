@@ -23,7 +23,7 @@ use config::{
     ider::SnowflakeIdGenerator,
     is_local_disk_storage,
     meta::{cluster::RoleGroup, stream::StreamType},
-    utils::json,
+    utils::{json, time::now_micros},
 };
 use hashbrown::{HashMap, HashSet};
 use infra::{
@@ -130,6 +130,18 @@ pub async fn delete(
 ) -> Result<(), anyhow::Error> {
     let stream_type = stream_type.unwrap_or(StreamType::Logs);
     infra::schema::delete(org_id, stream_type, stream_name, None).await?;
+    if stream_type == StreamType::EnrichmentTables {
+        // Enrichment table size is not deleted by schema delete
+        // Since we are storing the current size of the table in bytes in the meta table,
+        // when we delete enrichment table, we need to delete the size from the db as well.
+        if let Err(e) = super::enrichment_table::delete_table_size(org_id, stream_name).await {
+            log::error!("Failed to delete table size: {}", e);
+        }
+        if let Err(e) = super::enrichment_table::delete_meta_table_stats(org_id, stream_name).await
+        {
+            log::error!("Failed to delete meta table stats: {}", e);
+        }
+    }
 
     // super cluster
     #[cfg(feature = "enterprise")]
@@ -301,9 +313,9 @@ pub async fn watch() -> Result<(), anyhow::Error> {
                 let ts_range = if ev_start_dt == 0 && prev_start_dt == 0 {
                     None
                 } else if ev_start_dt == 0 || (prev_start_dt > 0 && ev_start_dt > prev_start_dt) {
-                    Some((prev_start_dt, chrono::Utc::now().timestamp_micros()))
+                    Some((prev_start_dt, now_micros()))
                 } else {
-                    Some((ev_start_dt, chrono::Utc::now().timestamp_micros()))
+                    Some((ev_start_dt, now_micros()))
                 };
 
                 let mut schema_versions =
@@ -337,7 +349,7 @@ pub async fn watch() -> Result<(), anyhow::Error> {
                 }
                 let latest_schema = latest_schema.pop().unwrap();
                 let settings = unwrap_stream_settings(&latest_schema).unwrap_or_default();
-                if settings.store_original_data {
+                if settings.store_original_data || settings.index_original_data {
                     if let dashmap::Entry::Vacant(entry) =
                         STREAM_RECORD_ID_GENERATOR.entry(item_key.to_string())
                     {
@@ -346,6 +358,7 @@ pub async fn watch() -> Result<(), anyhow::Error> {
                 }
                 let mut w = STREAM_SETTINGS.write().await;
                 w.insert(item_key.to_string(), settings);
+                infra::schema::set_stream_settings_atomic(w.clone());
                 drop(w);
                 let mut w = STREAM_SCHEMAS_LATEST.write().await;
                 w.insert(
@@ -427,6 +440,7 @@ pub async fn watch() -> Result<(), anyhow::Error> {
                 let mut w = STREAM_SETTINGS.write().await;
                 w.remove(item_key);
                 w.shrink_to_fit();
+                infra::schema::set_stream_settings_atomic(w.clone());
                 drop(w);
                 cache::stats::remove_stream_stats(org_id, stream_name, stream_type);
                 if let Err(e) =
@@ -485,7 +499,7 @@ pub async fn cache() -> Result<(), anyhow::Error> {
         }
         let latest_schema = latest_schema.last().unwrap();
         let settings = unwrap_stream_settings(latest_schema).unwrap_or_default();
-        if settings.store_original_data {
+        if settings.store_original_data || settings.index_original_data {
             if let dashmap::Entry::Vacant(entry) =
                 STREAM_RECORD_ID_GENERATOR.entry(item_key.to_string())
             {
@@ -494,6 +508,7 @@ pub async fn cache() -> Result<(), anyhow::Error> {
         }
         let mut w = STREAM_SETTINGS.write().await;
         w.insert(item_key.to_string(), settings);
+        infra::schema::set_stream_settings_atomic(w.clone());
         drop(w);
         let mut w = STREAM_SCHEMAS_LATEST.write().await;
         w.insert(

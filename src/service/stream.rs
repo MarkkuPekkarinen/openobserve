@@ -39,6 +39,7 @@ use infra::{
     table::distinct_values::{DistinctFieldRecord, OriginType, check_field_use},
 };
 
+use super::db::enrichment_table;
 use crate::{
     common::meta::{
         authz::Authz,
@@ -62,7 +63,7 @@ pub async fn get_stream(
 
     if schema != Schema::empty() {
         let mut stats = stats::get_stream_stats(org_id, stream_name, stream_type);
-        transform_stats(&mut stats);
+        transform_stats(&mut stats, org_id, stream_name, stream_type).await;
         Some(stream_res(stream_name, stream_type, schema, Some(stats)))
     } else {
         None
@@ -110,7 +111,9 @@ pub async fn get_streams(
             stream_loc.stream_name.as_str(),
             stream_loc.stream_type,
         );
-        if stats.eq(&StreamStats::default()) {
+        if stats.eq(&StreamStats::default())
+            && stream_loc.stream_type != StreamType::EnrichmentTables
+        {
             indices_res.push(stream_res(
                 stream_loc.stream_name.as_str(),
                 stream_loc.stream_type,
@@ -118,7 +121,13 @@ pub async fn get_streams(
                 None,
             ));
         } else {
-            transform_stats(&mut stats);
+            transform_stats(
+                &mut stats,
+                org_id,
+                stream_loc.stream_name.as_str(),
+                stream_loc.stream_type,
+            )
+            .await;
             indices_res.push(stream_res(
                 stream_loc.stream_name.as_str(),
                 stream_loc.stream_type,
@@ -314,10 +323,7 @@ pub async fn save_stream_settings(
     let mut metadata = schema.metadata.clone();
     metadata.insert("settings".to_string(), json::to_string(&settings).unwrap());
     if !metadata.contains_key("created_at") {
-        metadata.insert(
-            "created_at".to_string(),
-            chrono::Utc::now().timestamp_micros().to_string(),
-        );
+        metadata.insert("created_at".to_string(), now_micros().to_string());
     }
     db::schema::update_setting(org_id, stream_name, stream_type, metadata)
         .await
@@ -355,6 +361,28 @@ pub async fn update_stream_settings(
 
             if let Some(data_retention) = new_settings.data_retention {
                 settings.data_retention = data_retention;
+            }
+
+            if let Some(index_original_data) = new_settings.index_original_data {
+                settings.index_original_data = index_original_data;
+            }
+
+            if let Some(index_all_values) = new_settings.index_all_values {
+                settings.index_all_values = index_all_values;
+            }
+
+            // if index_original_data is true, store_original_data must be true
+            if settings.index_original_data {
+                settings.store_original_data = true;
+            }
+
+            // index_original_data & index_all_values only can open one at a time
+            if settings.index_original_data && settings.index_all_values {
+                return Ok(HttpResponse::BadRequest().json(MetaHttpResponse::error(
+                    http::StatusCode::BAD_REQUEST.into(),
+                    "index_original_data & index_all_values cannot be true at the same time"
+                        .to_string(),
+                )));
             }
 
             // check for user defined schema
@@ -461,7 +489,7 @@ pub async fn update_stream_settings(
                     // we cannot allow duplicate entries here
                     let temp = DistinctField {
                         name: f.to_owned(),
-                        added_ts: chrono::Utc::now().timestamp_micros(),
+                        added_ts: now_micros(),
                     };
                     if !settings.distinct_value_fields.contains(&temp) {
                         settings.distinct_value_fields.push(temp);
@@ -601,6 +629,7 @@ pub async fn delete_stream(
     // delete stream settings cache
     let mut w = STREAM_SETTINGS.write().await;
     w.remove(&key);
+    infra::schema::set_stream_settings_atomic(w.clone());
     drop(w);
 
     // delete stream record id generator cache
@@ -648,10 +677,21 @@ pub async fn delete_stream(
     )))
 }
 
-fn transform_stats(stats: &mut StreamStats) {
+async fn transform_stats(
+    stats: &mut StreamStats,
+    org_id: &str,
+    stream_name: &str,
+    stream_type: StreamType,
+) {
     stats.storage_size /= SIZE_IN_MB;
     stats.compressed_size /= SIZE_IN_MB;
     stats.index_size /= SIZE_IN_MB;
+    if stream_type == StreamType::EnrichmentTables {
+        if let Some(meta) = enrichment_table::get_meta_table_stats(org_id, stream_name).await {
+            stats.doc_time_min = meta.start_time;
+            stats.doc_time_max = meta.end_time;
+        }
+    }
 }
 
 pub fn stream_created(schema: &Schema) -> Option<i64> {

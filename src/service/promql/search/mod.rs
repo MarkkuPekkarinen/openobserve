@@ -84,7 +84,7 @@ async fn search_in_cluster(
     user_email: &str,
 ) -> Result<Value> {
     let op_start = std::time::Instant::now();
-    let started_at = chrono::Utc::now().timestamp_micros();
+    let started_at = now_micros();
     let cfg = get_config();
 
     let &cluster_rpc::MetricsQueryStmt {
@@ -140,16 +140,13 @@ async fn search_in_cluster(
     let (start, cached_values) = if cache_disabled {
         (start, vec![])
     } else {
-        config::metrics::QUERY_METRICS_CACHE_REQUESTS
-            .with_label_values(&[])
-            .inc();
         let start_time = std::time::Instant::now();
         match cache::get(query, start, end, step).await {
             Ok(Some((new_start, values))) => {
                 let took = start_time.elapsed().as_millis() as i32;
-                config::metrics::QUERY_METRICS_CACHE_HITS
-                    .with_label_values(&[])
-                    .inc();
+                config::metrics::QUERY_METRICS_CACHE_RATIO
+                    .with_label_values(&[&req.org_id])
+                    .observe((new_start - start) as f64 / (end - start) as f64);
                 log::info!(
                     "[trace_id {trace_id}] promql->search->cache: hit cache, took: {} ms",
                     took
@@ -254,11 +251,9 @@ async fn search_in_cluster(
                             &node.get_grpc_addr(),
                             err
                         );
-                        if err.code() == tonic::Code::Internal {
-                            let err = ErrorCodes::from_json(err.message())?;
-                            return Err(Error::ErrorCode(err));
-                        }
-                        return Err(server_internal_error("search node error"));
+                        let err = ErrorCodes::from_json(err.message())
+                            .unwrap_or(ErrorCodes::ServerInternalError(err.to_string()));
+                        return Err(Error::ErrorCode(err));
                     }
                 };
                 let scan_stats = response.scan_stats.as_ref().unwrap();
@@ -361,8 +356,16 @@ async fn search_in_cluster(
     // cache the result
     if !cache_disabled {
         if let Some(matrix) = values.get_ref_matrix_values() {
-            if let Err(err) =
-                cache::set(trace_id, query, original_start, end, step, matrix.to_vec()).await
+            if let Err(err) = cache::set(
+                trace_id,
+                &req.org_id,
+                query,
+                original_start,
+                end,
+                step,
+                matrix.to_vec(),
+            )
+            .await
             {
                 log::error!(
                     "[trace_id {trace_id}] promql->search->cache: set cache err: {:?}",
