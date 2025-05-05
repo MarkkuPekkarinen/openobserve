@@ -47,7 +47,8 @@ struct URLDetails {
     method = "GET",
     method = "POST",
     method = "PUT",
-    method = "DELETE"
+    method = "DELETE",
+    method = "OPTIONS"
 )]
 pub async fn config(
     req: HttpRequest,
@@ -62,7 +63,8 @@ pub async fn config(
     method = "GET",
     method = "POST",
     method = "PUT",
-    method = "DELETE"
+    method = "DELETE",
+    method = "OPTIONS"
 )]
 pub async fn config_paths(
     req: HttpRequest,
@@ -78,6 +80,7 @@ pub async fn config_paths(
     method = "POST",
     method = "PUT",
     method = "DELETE",
+    method = "OPTIONS",
     method = "PATCH"
 )]
 pub async fn api(
