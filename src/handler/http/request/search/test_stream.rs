@@ -1,8 +1,3 @@
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_assignments)]
-#![allow(unused_doc_comments)]
-
 // Copyright 2025 OpenObserve Inc.
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,7 +13,16 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{io::Error, ops::ControlFlow, time::Instant};
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_assignments)]
+#![allow(unused_doc_comments)]
+
+use std::{
+    io::{Error, Write},
+    ops::ControlFlow,
+    time::Instant,
+};
 
 use actix_web::{HttpRequest, HttpResponse, http::StatusCode, post, web};
 use bytes::Bytes as BytesImpl;
@@ -49,7 +53,11 @@ use tracing::{Instrument, Span};
 
 use crate::{
     common::{
-        meta::{self, search::{MultiCachedQueryResponse, QueryDelta, CachedQueryResponse}, http::HttpResponse as MetaHttpResponse},
+        meta::{
+            self,
+            http::HttpResponse as MetaHttpResponse,
+            search::{CachedQueryResponse, MultiCachedQueryResponse, QueryDelta},
+        },
         utils::{
             functions,
             http::{
@@ -58,7 +66,7 @@ use crate::{
                 get_use_cache_from_request, get_work_group,
             },
             stream::get_max_query_range,
-            websocket::{update_histogram_interval_in_query, calc_queried_range},
+            websocket::{calc_queried_range, update_histogram_interval_in_query},
         },
     },
     service::{
@@ -176,9 +184,14 @@ pub async fn test_http2_stream(
     // Check permissions for each stream
     #[cfg(feature = "enterprise")]
     for stream_name in stream_names.iter() {
-        if let Err(e) =
-            o2_enterprise::enterprise::check::check_permissions(stream_name, stream_type,
-    user_id, org_id).await     {
+        if let Err(e) = o2_enterprise::enterprise::check::check_permissions(
+            stream_name,
+            stream_type,
+            user_id,
+            org_id,
+        )
+        .await
+        {
             return Ok(MetaHttpResponse::bad_request(e));
         }
     }
@@ -236,34 +249,39 @@ pub async fn test_http2_stream(
         req.search_type = Some(SearchEventType::Other);
     }
 
-
     // Create a channel for streaming results
     let (tx, rx) = mpsc::channel::<Result<StreamResponses, infra::errors::Error>>(100);
     let mut sender = tx.clone();
 
     // Spawn the test data generation in a separate task
-    actix_web::rt::spawn(async move {
+    tokio::task::spawn(async move {
         log::info!(
             "[HTTP2_STREAM] trace_id: {} Received test HTTP/2 stream request for org_id: {}",
             trace_id,
             org_id
         );
 
-        let max_query_range = get_max_query_range(&stream_names, &org_id, &user_id, stream_type).await; // hours
+        let max_query_range =
+            get_max_query_range(&stream_names, &org_id, &user_id, stream_type).await; // hours
 
         if req.query.from == 0 {
-            let c_resp = match cache::check_cache_v2(&trace_id, &org_id, stream_type, &req,use_cache).instrument(search_span.clone()).await {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("[SEARCH_STREAM] trace_id: {}; Failed to check cache: {}",
-                        trace_id,
-                        e.to_string()
-                    );
-                    // send error message to client
-                    sender.send(Err(e)).await.unwrap();
-                    return;
-                }
-            };
+            let c_resp =
+                match cache::check_cache_v2(&trace_id, &org_id, stream_type, &req, use_cache)
+                    .instrument(search_span.clone())
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!(
+                            "[SEARCH_STREAM] trace_id: {}; Failed to check cache: {}",
+                            trace_id,
+                            e.to_string()
+                        );
+                        // send error message to client
+                        sender.send(Err(e)).await.unwrap();
+                        return;
+                    }
+                };
             let local_c_resp = c_resp.clone();
             let cached_resp = local_c_resp.cached_response;
             let mut deltas = local_c_resp.deltas;
@@ -286,13 +304,13 @@ pub async fn test_http2_stream(
 
             log::info!(
                 "[SEARCH_STREAM] trace_id: {}, found cache responses len:{}, with hits: {},
-        cache_start_time: {:#?}, cache_end_time: {:#?}",         trace_id,
+        cache_start_time: {:#?}, cache_end_time: {:#?}",
+                trace_id,
                 cached_resp.len(),
                 cached_hits,
                 c_start_time,
                 c_end_time
             );
-
 
             // handle cache responses and deltas
             if !cached_resp.is_empty() && cached_hits > 0 {
@@ -323,7 +341,8 @@ pub async fn test_http2_stream(
                     sender.clone(),
                 )
                 .instrument(search_span.clone())
-                .await {
+                .await
+                {
                     sender.send(Err(e)).await.unwrap();
                     return;
                 }
@@ -349,7 +368,8 @@ pub async fn test_http2_stream(
                     sender.clone(),
                 )
                 .instrument(search_span.clone())
-                .await {
+                .await
+                {
                     sender.send(Err(e)).await.unwrap();
                     return;
                 }
@@ -402,27 +422,40 @@ pub async fn test_http2_stream(
     // Return streaming response
     let stream = rx.map(|result| match result {
         Ok(v) => {
-            let mut responses = match v {
-                StreamResponses::SearchResponse { results, streaming_output } => {
+            let mut responses = Vec::new();
+
+            // serialize the response
+            match v {
+                StreamResponses::SearchResponse {
+                    results,
+                    streaming_output,
+                } => {
+                    // add prefix to the response
+                    responses.write_all(b"data: ").unwrap();
                     let res = serde_json::json!({
                         "data": results,
                         "streaming_output": streaming_output
                     });
-                    json::to_vec(&res).expect("Failed to serialize search response")
+                    let message = json::to_vec(&res).expect("Failed to serialize search response");
+                    responses.write_all(&message).unwrap();
                 }
                 StreamResponses::Error { code, message } => {
+                    // add prefix to the response
+                    responses.write_all(b"event: error\ndata: ").unwrap();
                     let res = serde_json::json!({
                         "code": code,
                         "message": message
                     });
-                    json::to_vec(&res).unwrap()
+                    let message = json::to_vec(&res).unwrap();
+                    responses.write_all(&message).unwrap();
                 }
             };
+
             // Add a newline to the end of the bytes
-            responses.push(b'\n');
+            responses.write_all(b"\n\n").unwrap();
 
             Ok(BytesImpl::from(responses))
-        },
+        }
         Err(e) => {
             log::error!("[HTTP2_STREAM] Error in stream: {}", e);
             Err(e)
@@ -431,10 +464,8 @@ pub async fn test_http2_stream(
 
     Ok(HttpResponse::Ok()
         .content_type("text/event-stream")
-        .append_header(("Connection", "keep-alive"))
         .streaming(stream))
 }
-
 
 // Do partitioned search without cache
 #[tracing::instrument(name = "service:search:websocket::do_partitioned_search", skip_all)]
@@ -512,6 +543,9 @@ pub async fn do_partitioned_search(
     );
 
     for (idx, &[start_time, end_time]) in partitions.iter().enumerate() {
+        log::info!("start_time: {}, end_time: {}", start_time, end_time);
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
         let mut req = req.clone();
         req.query.start_time = start_time;
         req.query.end_time = end_time;
@@ -521,13 +555,14 @@ pub async fn do_partitioned_search(
         }
 
         // do not use cache for partitioned search without cache
-        let mut search_res = match do_search(trace_id, org_id, stream_type, &req, user_id, false).await {
-            Ok(v) => v,
-            Err(e) => {
-                sender.send(Err(e)).await.unwrap();
-                return Ok(());
-            }
-        };
+        let mut search_res =
+            match do_search(trace_id, org_id, stream_type, &req, user_id, false).await {
+                Ok(v) => v,
+                Err(e) => {
+                    sender.send(Err(e)).await.unwrap();
+                    return Ok(());
+                }
+            };
         curr_res_size += search_res.hits.len() as i64;
 
         if !search_res.hits.is_empty() {
@@ -712,12 +747,14 @@ pub async fn handle_cache_responses_and_deltas(
 ) -> Result<(), infra::errors::Error> {
     // Force set order_by to desc for dashboards & histogram
     // so that deltas are processed in the reverse order
-    let cache_order_by =
-        if req.search_type.expect("search_type is required") == SearchEventType::Dashboards || req.query.size == -1 {
-            &OrderBy::Desc
-        } else {
-            req_order_by
-        };
+    let cache_order_by = if req.search_type.expect("search_type is required")
+        == SearchEventType::Dashboards
+        || req.query.size == -1
+    {
+        &OrderBy::Desc
+    } else {
+        req_order_by
+    };
 
     // sort both deltas and cache by order_by
     match cache_order_by {
@@ -916,7 +953,9 @@ async fn process_delta(
     );
 
     // for dashboards & histograms
-    if req.search_type.expect("search_type is required") == SearchEventType::Dashboards || req.query.size == -1 {
+    if req.search_type.expect("search_type is required") == SearchEventType::Dashboards
+        || req.query.size == -1
+    {
         // sort partitions by timestamp in desc
         partitions.sort_by(|a, b| b[0].cmp(&a[0]));
     }
@@ -931,7 +970,8 @@ async fn process_delta(
         }
 
         // use cache for delta search
-        let mut search_res = do_search(&trace_id, &org_id, stream_type, &req, user_id, true).await?;
+        let mut search_res =
+            do_search(&trace_id, &org_id, stream_type, &req, user_id, true).await?;
         *curr_res_size += search_res.hits.len() as i64;
 
         log::info!(
@@ -1167,7 +1207,7 @@ async fn send_cached_responses(
         cached.cached_response.hits.len(),
         cached.cached_response.result_cache_ratio,
     );
-    let response = StreamResponses::SearchResponse { 
+    let response = StreamResponses::SearchResponse {
         results: cached.cached_response,
         streaming_output: false,
     };
