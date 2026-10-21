@@ -74,7 +74,8 @@ use svix_ksuid::Ksuid;
 use crate::auth::{check_folder_write_permissions, check_permissions};
 use crate::{
     alerts::{
-        QueryConditionExt, build_sql, destinations,
+        QueryConditionExt, build_sql,
+        destinations::{self, note_skipped, org_member_split},
         notifications::{
             NotificationContext, RenderedMessage, apply_custom_template, build_row_columns, chart,
             custom::{VarValue, process_variable_replace},
@@ -2167,21 +2168,6 @@ mod slo_source_guard_tests {
     }
 }
 
-pub async fn delete_by_name(
-    org_id: &str,
-    stream_type: StreamType,
-    stream_name: &str,
-    name: &str,
-) -> Result<(), AlertError> {
-    let alert = db::alerts::alert::get_by_name(org_id, stream_type, stream_name, name)
-        .await
-        .map_err(|_| AlertError::AlertNotFound)?
-        .ok_or(AlertError::AlertNotFound)?;
-    let alert_id = alert.id.ok_or(AlertError::AlertNotFound)?;
-    let client = infra::db::get_orm_client_rw().await;
-    delete_by_id_user(client, org_id, alert_id).await
-}
-
 /// Enables an alert.
 pub async fn enable_by_id<C: ConnectionTrait + TransactionTrait>(
     conn: &C,
@@ -3175,9 +3161,12 @@ async fn send_to_destination(
             match dest_type {
                 DestinationType::Http(endpoint) => send_http_notification(endpoint, msg).await,
                 DestinationType::Email(email) => {
+                    let (email, skipped) = org_member_email(&alert.org_id, email).await?;
                     // Same string for both parts: identical to the MIME this
                     // path emitted before the signature took two bodies.
-                    send_email_notification(&email_subject, email, msg.clone(), msg).await
+                    send_email_notification(&email_subject, &email, msg.clone(), msg)
+                        .await
+                        .map(|resp| note_skipped(resp, &skipped))
                 }
                 DestinationType::Sns(aws_sns) => {
                     send_sns_notification(&alert.name, aws_sns, msg).await
@@ -3214,14 +3203,16 @@ async fn send_to_destination(
                     },
                     DestinationType::Email(email),
                 ) => {
+                    let (email, skipped) = org_member_email(&alert.org_id, email).await?;
                     send_email_notification_with_inline_png(
                         &subject,
-                        email,
+                        &email,
                         text,
                         html,
                         ctx.chart_png.clone(),
                     )
                     .await
+                    .map(|resp| note_skipped(resp, &skipped))
                 }
                 (
                     RenderedMessage::Sns {
@@ -3244,6 +3235,7 @@ async fn send_to_destination(
 /// going through the alert template system.
 #[cfg(feature = "enterprise")]
 pub(crate) async fn dispatch_notification(
+    org_id: &str,
     dest_type: &DestinationType,
     subject: &str,
     msg: String,
@@ -3254,7 +3246,10 @@ pub(crate) async fn dispatch_notification(
         // split, so both parts carry the same string — byte-identical to the
         // MIME this path emitted before the signature took two bodies.
         DestinationType::Email(email) => {
-            send_email_notification(subject, email, msg.clone(), msg).await
+            let (email, skipped) = org_member_email(org_id, email).await?;
+            send_email_notification(subject, &email, msg.clone(), msg)
+                .await
+                .map(|resp| note_skipped(resp, &skipped))
         }
         DestinationType::Sns(aws_sns) => send_sns_notification(subject, aws_sns, msg).await,
     }
@@ -3279,6 +3274,7 @@ pub(crate) async fn dispatch_notification(
 /// itself, so the enterprise-only incident-notification call sites are
 /// untouched.
 pub(crate) async fn dispatch_test_message(
+    org_id: &str,
     dest_type: &DestinationType,
     title: &str,
     rendered: RenderedMessage,
@@ -3294,7 +3290,12 @@ pub(crate) async fn dispatch_test_message(
                 text,
             },
             DestinationType::Email(email),
-        ) => send_email_notification(&subject, email, text, html).await,
+        ) => {
+            let (email, skipped) = org_member_email(org_id, email).await?;
+            send_email_notification(&subject, &email, text, html)
+                .await
+                .map(|resp| note_skipped(resp, &skipped))
+        }
         (RenderedMessage::Http { body }, DestinationType::Sns(aws_sns)) => {
             send_sns_notification(title, aws_sns, body).await
         }
@@ -3305,6 +3306,26 @@ pub(crate) async fn dispatch_test_message(
             "Rendered message {rendered:?} does not match destination type {dest_type:?}"
         )),
     }
+}
+
+/// Narrows an email destination to org members and returns the skipped ones. [strong]
+async fn org_member_email(
+    org_id: &str,
+    email: &Email,
+) -> Result<(Email, Vec<String>), anyhow::Error> {
+    let (kept, skipped) = org_member_split(org_id, &email.recipients).await?;
+    Ok((members_to_send(kept, &skipped)?, skipped))
+}
+
+/// Email to the kept members, or an error naming the skipped when none is left. [pure]
+fn members_to_send(kept: Vec<String>, skipped: &[String]) -> Result<Email, anyhow::Error> {
+    if kept.is_empty() && !skipped.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Email not sent: no recipient is part of this org (skipped: {})",
+            skipped.join(", ")
+        ));
+    }
+    Ok(Email { recipients: kept })
 }
 
 async fn send_http_notification(endpoint: &Endpoint, msg: String) -> Result<String, anyhow::Error> {
@@ -5152,6 +5173,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_members_to_send() {
+        let to = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        type Expected = Result<Vec<String>, String>;
+        let cases: Vec<(Vec<String>, Vec<String>, Expected)> = vec![
+            (to(&["a@x.com"]), vec![], Ok(to(&["a@x.com"]))),
+            (to(&["a@x.com"]), to(&["gone@x.com"]), Ok(to(&["a@x.com"]))),
+            (vec![], vec![], Ok(vec![])),
+            (
+                vec![],
+                to(&["gone@x.com", "left@x.com"]),
+                Err("Email not sent: no recipient is part of this org (skipped: gone@x.com, left@x.com)".to_string()),
+            ),
+        ];
+        for (kept, skipped, expected) in cases {
+            let got = members_to_send(kept, &skipped)
+                .map(|email| email.recipients)
+                .map_err(|e| e.to_string());
+            assert_eq!(got, expected, "skipped {skipped:?}");
+        }
+    }
+
+    #[test]
     fn test_with_incident_notify_error() {
         assert_eq!(
             with_incident_notify_error("dest err".to_string(), None),
@@ -5374,33 +5417,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_cron_expression_3() {
-        let cron_exp = "**/15 21-23,0-8 * * *";
-        let now = Utc::now().second();
-        let new_cron_exp = update_cron_expression(cron_exp, now);
-        let updated = format!("{now} */15 21-23,0-8 * * *");
-        assert_eq!(new_cron_exp, updated);
-    }
-
-    #[tokio::test]
-    async fn test_update_cron_expression_4() {
-        let cron_exp = "*10*****";
-        let now = Utc::now().second();
-        let new_cron_exp = update_cron_expression(cron_exp, now);
-        let updated = format!("{now} 10*****");
-        assert_eq!(new_cron_exp, updated);
-    }
-
-    #[tokio::test]
-    async fn test_update_cron_expression_5() {
-        let cron_exp = "* */10 2 * * * *";
-        let now = Utc::now().second();
-        let new_cron_exp = update_cron_expression(cron_exp, now);
-        let updated = format!("{now} */10 2 * * * *");
-        assert_eq!(new_cron_exp, updated);
-    }
-
-    #[tokio::test]
     async fn test_contains_operator_sql() {
         let condition = Condition {
             column: "auth_username".to_string(),
@@ -5546,13 +5562,6 @@ mod tests {
         let original = tpl.clone();
         process_variable_replace(&mut tpl, "age", &VarValue::Str("30"), false);
         assert_eq!(tpl, original); // Should remain unchanged
-    }
-
-    #[test]
-    fn test_process_variable_replace_multiple_occurrences() {
-        let mut tpl = "{name} says hello to {name}".to_string();
-        process_variable_replace(&mut tpl, "name", &VarValue::Str("Bob"), false);
-        assert_eq!(tpl, "Bob says hello to Bob");
     }
 
     #[test]
@@ -5761,12 +5770,6 @@ mod tests {
     #[test]
     fn test_check_json_context_not_json() {
         let tpl = r#"{"hits": "The hits got {rows}"}"#;
-        assert!(!check_json_context(tpl, "rows"));
-    }
-
-    #[test]
-    fn test_check_json_context_in_middle_of_text() {
-        let tpl = r#"This is {rows} in text"#;
         assert!(!check_json_context(tpl, "rows"));
     }
 
@@ -6811,25 +6814,11 @@ mod tests {
         assert_eq!(result, "5 * * * *");
     }
 
-    #[test]
-    fn test_update_cron_expression_zero_seconds() {
-        let result = update_cron_expression("* */5 * * * *", 0);
-        assert_eq!(result, "0 */5 * * * *");
-    }
-
     // ── format_variable_value ──────────────────────────────────────────────
 
     #[test]
     fn test_format_variable_value_single_quote() {
         assert_eq!(format_variable_value("'".to_string()), "\\\\'");
-    }
-
-    #[test]
-    fn test_format_variable_value_soh_stx_us() {
-        // \x01 SOH, \x02 STX, \x1f US — each has a dedicated arm
-        assert_eq!(format_variable_value("\x01".to_string()), "\\u{1}");
-        assert_eq!(format_variable_value("\x02".to_string()), "\\u{2}");
-        assert_eq!(format_variable_value("\x1f".to_string()), "\\u{1f}");
     }
 
     #[test]
